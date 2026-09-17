@@ -212,6 +212,7 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
   "matchStatus": "Verified Parity (67/67 Endpoints)",
   "openapi": "3.0.0",
   "servedAt": "/api/docs",
+  "swaggerUi": "/swagger-ui.html  (optional — UI route when it differs from servedAt)",
   "securityScheme": "bearerAuth (JWT Bearer Token)",
   "servers": [
     { "url": "http://localhost:3000", "description": "Local Development Server" },
@@ -222,6 +223,12 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
   ]
 }
 ```
+`servers[0].url` is what the dashboard shows as **Base URL** and uses in every cURL snippet, and
+`openapi` is the version written into the generated spec. Spring projects default to
+`/v3/api-docs`, `/swagger-ui.html` and OpenAPI `3.1.0` when springdoc is on the classpath
+(`/v2/api-docs` for springfox), with the local URL built from `server.port` /
+`server.servlet.context-path` in `application.{yml,properties}` (fallback 8080).
+Express / NestJS / FastAPI keep `/api/docs` on port 3000.
 
 #### 7. `modules`
 **Adding a new module:**
@@ -310,6 +317,22 @@ Catalog mapping raw SQL statements or query builders to repository functions and
 }
 ```
 
+#### 10. `messaging` (optional)
+Consumers and producers found by the Java scanner (`@KafkaListener`, `@RabbitListener`,
+`@JmsListener`, `@SqsListener`, `*Template.send()` / `convertAndSend()`). The **Messaging** tab
+only appears when this section is non-empty:
+```json
+{
+  "listeners": [
+    { "broker": "kafka", "topics": ["billing.invoice.created"], "groupId": "billing", "handler": "InvoiceEventsListener.onInvoice()", "file": "…/InvoiceEventsListener.java" }
+  ],
+  "producers": [
+    { "broker": "kafka", "topic": "billing.notifications", "handler": "NotificationPublisher.publish()", "file": "…/NotificationPublisher.java" }
+  ]
+}
+```
+Topics given as `${property}` placeholders are kept verbatim.
+
 ---
 
 ### STEP 4 — Regenerate HTML Dashboard
@@ -339,7 +362,9 @@ Verify `docs/architecture/architecture.html`:
    - **API Catalog & cURL:** Endpoint list with copyable `cURL` request snippets.
    - **OpenAPI 3.0 JSON Spec:** Formatted JSON specification with 1-click copy button.
 5. **Interactive Diagrams:** System Architecture and Docker Topology render cleanly via Mermaid.js with interactive pan/zoom toolbars and hand (grab) cursor feedback.
-6. **SQL Queries:** Full system query catalog displayed with syntax highlighting and mapped endpoints.
+6. **SQL Queries:** Query catalog rendered lazily from embedded JSON (50 cards at a time with a
+   filter box, so pages with hundreds of queries stay small); PDF export renders the full list.
+7. **Messaging (Java only, when present):** Kafka / RabbitMQ / JMS listeners and producers with their topics.
 
 ---
 

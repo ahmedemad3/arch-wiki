@@ -130,7 +130,8 @@ def _java_build_info(root):
     'kotlinDsl': bool, 'javaVersion': '25'|None, 'springBootVersion': '4.0.0'|None}.
     """
     info = {'buildTool': None, 'buildFile': None, 'kotlinDsl': False,
-            'javaVersion': None, 'springBootVersion': None}
+            'javaVersion': None, 'springBootVersion': None,
+            'apiDocs': None, 'migrations': None, 'serverPort': None, 'contextPath': ''}
     bf = _java_build_file(root)
     if not bf:
         return info
@@ -173,6 +174,34 @@ def _java_build_info(root):
         for extra in [os.path.join(root, 'gradle', 'libs.versions.toml'), os.path.join(root, 'gradle.properties')]:
             m = re.search(r'^\s*(?:java|jdk)(?:[-_.]?version)?\s*=\s*["\']?(\d+)', _read(extra), re.MULTILINE)
             if m: info['javaVersion'] = m.group(1); break
+
+    # Dependencies that decide API-docs routes and migration tooling (root + sub-project build files)
+    dep_txt = txt
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', '.gradle')]
+        for f in fls:
+            if f in ('pom.xml', 'build.gradle', 'build.gradle.kts'):
+                dep_txt += '\n' + _read(os.path.join(r, f))
+    if 'springdoc' in dep_txt: info['apiDocs'] = 'springdoc'
+    elif 'springfox' in dep_txt: info['apiDocs'] = 'springfox'
+    if 'flyway' in dep_txt: info['migrations'] = 'flyway'
+    elif 'liquibase' in dep_txt: info['migrations'] = 'liquibase'
+
+    # server.port / context-path from the first application.{yml,yaml,properties} outside tests
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', 'test')]
+        for f in sorted(fls):
+            if not re.match(r'application(?:-(?:dev|local|default))?\.(?:ya?ml|properties)$', f): continue
+            cfg = _read(os.path.join(r, f))
+            if f.endswith('.properties'):
+                pm = re.search(r'^\s*server\.port\s*[=:]\s*(\d+)', cfg, re.MULTILINE)
+                cm = re.search(r'^\s*server\.servlet\.context-path\s*[=:]\s*(\S+)', cfg, re.MULTILINE)
+            else:
+                pm = re.search(r'^server:\s*\n(?:[ \t]+.*\n)*?[ \t]+port:\s*["\']?(\d+)', cfg, re.MULTILINE)
+                cm = re.search(r'context-path:\s*["\']?([^\s"\']+)', cfg)
+            if pm and not info['serverPort']: info['serverPort'] = int(pm.group(1))
+            if cm and not info['contextPath']: info['contextPath'] = cm.group(1).rstrip('/')
+        if info['serverPort']: break
     return info
 
 def _detect_fw(root):
@@ -1425,6 +1454,67 @@ def _scan_sql_java(root, modules=None):
                 _add(sql, kind, function, purpose)
     return queries
 
+# ---------------------------------------------------------------------------
+# MESSAGING (Java) — @KafkaListener / @RabbitListener / @JmsListener / @SqsListener
+# consumers and KafkaTemplate / RabbitTemplate / JmsTemplate producers.
+# ---------------------------------------------------------------------------
+
+_LISTENER_ANNOS = {'KafkaListener': ('kafka', ('topics', 'topicPattern', '')),
+                   'RabbitListener': ('rabbitmq', ('queues', 'bindings', '')),
+                   'JmsListener': ('jms', ('destination', '')),
+                   'SqsListener': ('sqs', ('value', 'queueNames', ''))}
+
+def _scan_messaging_java(root):
+    listeners, producers = [], []
+    for r, _, fls in os.walk(root):
+        norm_r = r.replace('\\', '/')
+        if any(x in norm_r for x in ['/target/', '/.idea/', '/build/', '/.git/', '/test/', '/node_modules/']):
+            continue
+        for f in sorted(fls):
+            if not f.endswith('.java'): continue
+            rf = os.path.join(r, f)
+            txt = open(rf, encoding='utf-8', errors='ignore').read()
+            if not re.search(r'@(?:Kafka|Rabbit|Jms|Sqs)Listener|(?:kafka|rabbit|jms)Template|KafkaTemplate|RabbitTemplate|JmsTemplate', txt):
+                continue
+            rel = os.path.relpath(rf, root).replace('\\', '/')
+            code, spans = _java_lex(txt)
+            consts = _java_string_consts(code)
+            class_name, _ = _java_type_name(code, spans)
+            class_name = class_name or f[:-5]
+            methods = _java_methods(code, spans)
+            for a in _java_annotations(code, spans):
+                if a['name'] not in _LISTENER_ANNOS: continue
+                broker, keys = _LISTENER_ANNOS[a['name']]
+                topics = []
+                for k in keys:
+                    topics = _string_values(a['kw'].get(k), consts)
+                    if topics: break
+                if not topics and a['kw'].get('topics'):
+                    topics = [a['kw']['topics']]                      # unresolved constant — keep the reference
+                meth = next((n for st, n in methods if st >= a['end']), None)
+                entry = {'broker': broker, 'topics': topics,
+                         'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel}
+                gid = _string_values(a['kw'].get('groupId'), consts)
+                if gid: entry['groupId'] = gid[0]
+                listeners.append(entry)
+            for m in re.finditer(r'\b(\w*(?:kafka|rabbit|jms)Template)\s*\.\s*(send|convertAndSend|sendDefault)\s*\(', code, re.IGNORECASE):
+                if _in_string(m.start(), spans): continue
+                end = _balanced(code, m.end() - 1, spans)
+                args = _split_top_level(code[m.end():end - 1])
+                if not args: continue
+                broker = 'kafka' if 'kafka' in m.group(1).lower() else ('rabbitmq' if 'rabbit' in m.group(1).lower() else 'jms')
+                # rabbit convertAndSend(exchange, routingKey, payload) → "exchange/routingKey"
+                topic_args = args[:2] if (broker == 'rabbitmq' and len(args) >= 3) else args[:1]
+                names = []
+                for ta in topic_args:
+                    v = _string_values(ta, consts)
+                    names.append(v[0] if v else ta.strip())
+                topic = '/'.join(names)
+                meth = next((n for st, n in reversed(methods) if st < m.start()), None)
+                producers.append({'broker': broker, 'topic': topic,
+                                  'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel})
+    return {'listeners': listeners, 'producers': producers}
+
 def _scan_workspaces(root):
     ws = []
     pom_path = os.path.join(root, 'pom.xml')
@@ -1474,7 +1564,7 @@ def _scan_workspaces(root):
     return ws or [{'id':'api','name':'api','type':'backend',
         'description':'Main REST API','port':3000,'entrypoint':'src/index.ts'}]
 
-def _scan_core_layer(root, fw):
+def _scan_core_layer(root, fw, build_file=None):
     sec, mid, svc = [], [], []
 
     if fw in ('spring', 'java'):
@@ -1504,7 +1594,7 @@ def _scan_core_layer(root, fw):
                     svc.append({"name": name_clean, "file": rel, "description": f"{stype} ({rel.split('/')[0]})", "exports": [name_clean]})
 
         if sec and not any(s['name'] == 'Spring Security & OAuth2' for s in sec):
-            sec.insert(0, {"name": "Spring Security & OAuth2", "file": "pom.xml", "description": "Framework OAuth2 Resource Server & JWT verification layer"})
+            sec.insert(0, {"name": "Spring Security & OAuth2", "file": build_file or "pom.xml", "description": "Framework OAuth2 Resource Server & JWT verification layer"})
 
     elif fw in ('express', 'nestjs', 'fastify'):
         pkg_path = os.path.join(root, 'package.json')
@@ -1930,7 +2020,10 @@ def init_architecture(target_root=None, placeholder_sql=False):
     sys_diag = _build_sys_diagram(modules, infrastructure)
 
     # 8. Core Layer & SQL Queries
-    core_layer = _scan_core_layer(root, fw)
+    core_layer = _scan_core_layer(root, fw, java_info.get('buildFile'))
+    messaging = _scan_messaging_java(root) if fw in ('spring', 'java') else {'listeners': [], 'producers': []}
+    if messaging['listeners'] or messaging['producers']:
+        print(f"[arch-wiki] Messaging: {len(messaging['listeners'])} listener(s), {len(messaging['producers'])} producer(s)")
 
     if fw in ('spring', 'java') and not placeholder_sql:
         sql_queries = _scan_sql_java(root, modules)
@@ -1943,6 +2036,20 @@ def init_architecture(target_root=None, placeholder_sql=False):
 
     today = datetime.date.today().isoformat()
     total_ep_str = f"{total_ep}/{total_ep}"
+
+    # API docs route / OpenAPI version / local server depend on the framework
+    if fw in ('spring', 'java'):
+        local_port = java_info.get('serverPort') or 8080
+        local_url = f"http://localhost:{local_port}{java_info.get('contextPath') or ''}"
+        if java_info.get('apiDocs') == 'springdoc':
+            swagger_meta = {'openapi': '3.1.0', 'servedAt': '/v3/api-docs', 'swaggerUi': '/swagger-ui.html'}
+        elif java_info.get('apiDocs') == 'springfox':
+            swagger_meta = {'openapi': '3.0.0', 'servedAt': '/v2/api-docs', 'swaggerUi': '/swagger-ui/'}
+        else:
+            swagger_meta = {'openapi': '3.0.0', 'servedAt': 'not detected (add springdoc-openapi)', 'swaggerUi': None}
+    else:  # Express / NestJS / FastAPI keep the historical defaults
+        local_url = 'http://localhost:3000'
+        swagger_meta = {'openapi': '3.0.0', 'servedAt': '/api/docs', 'swaggerUi': None}
 
     prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces, java_info)
 
@@ -1966,11 +2073,12 @@ def init_architecture(target_root=None, placeholder_sql=False):
         "systemArchitectureDiagram": sys_diag,
         "swaggerSchemas": {
             "matchStatus": f"Verified Parity ({total_ep_str} Endpoints)",
-            "openapi": "3.0.0",
-            "servedAt": "/api/docs",
+            "openapi": swagger_meta['openapi'],
+            "servedAt": swagger_meta['servedAt'],
+            "swaggerUi": swagger_meta['swaggerUi'],
             "securityScheme": "bearerAuth (JWT Bearer Token)",
             "servers": [
-                {"url": "http://localhost:3000", "description": "Local Development Server"},
+                {"url": local_url, "description": "Local Development Server"},
                 {"url": f"https://api.{display_name.lower().replace(' ','-')}.com", "description": "Production"}
             ],
             "schemas": []
@@ -1982,7 +2090,8 @@ def init_architecture(target_root=None, placeholder_sql=False):
         "coreLayer": core_layer,
         "dataFlow": _build_data_flow(fw, core_layer),
         "permissions": permissions,
-        "sqlQueries": sql_queries
+        "sqlQueries": sql_queries,
+        "messaging": messaging
     }
 
     scaffold = _apply_overrides(scaffold, root, arch_dir)
@@ -2121,6 +2230,28 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
             "description": "JavaScript runtime environment."
         })
 
+    gradle = fw in ('spring', 'java') and java_info.get('buildTool') == 'gradle'
+    if fw in ('spring', 'java'):
+        if gradle:
+            wrapper = os.path.isfile(os.path.join(root, 'gradlew'))
+            tools.append({
+                "name": "Gradle" + (" (wrapper included)" if wrapper else ""),
+                "version": ">= 8.x" if not wrapper else "./gradlew",
+                "required": True,
+                "category": "build",
+                "description": f"Build tool declared in {java_info.get('buildFile') or 'build.gradle'}"
+                               + (" (Kotlin DSL)." if java_info.get('kotlinDsl') else ".")
+            })
+        else:
+            wrapper = os.path.isfile(os.path.join(root, 'mvnw'))
+            tools.append({
+                "name": "Maven" + (" (wrapper included)" if wrapper else ""),
+                "version": ">= 3.9" if not wrapper else "./mvnw",
+                "required": True,
+                "category": "build",
+                "description": "Build tool declared in pom.xml."
+            })
+
     # 2. Containerization / Infrastructure tools
     has_compose = os.path.isfile(os.path.join(root, 'docker-compose.yml')) or os.path.isfile(os.path.join(root, 'docker-compose.yaml'))
     if infrastructure or has_compose:
@@ -2203,9 +2334,10 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
     elif fw in ('spring', 'java'):
         setup_steps.append({
             "step": step_num,
-            "title": "Build Maven Modules",
-            "command": "./mvnw clean install -DskipTests",
-            "description": "Compile Java packages and download Maven dependencies."
+            "title": "Build Gradle Projects" if gradle else "Build Maven Modules",
+            "command": "./gradlew build -x test" if gradle else "./mvnw clean install -DskipTests",
+            "description": "Compile Java sources and resolve dependencies via the Gradle wrapper." if gradle
+                           else "Compile Java packages and download Maven dependencies."
         })
     elif fw in ('fastapi', 'django', 'flask'):
         setup_steps.append({
@@ -2217,19 +2349,40 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
     step_num += 1
 
     # Step 4: Database Migrations & Seeds
+    if fw in ('spring', 'java'):
+        mig = java_info.get('migrations')
+        if mig == 'flyway':
+            mig_cmd = "./gradlew flywayMigrate" if gradle else "./mvnw flyway:migrate"
+            mig_desc = "Apply Flyway migrations (they also run automatically at application start)."
+        elif mig == 'liquibase':
+            mig_cmd = "./gradlew update" if gradle else "./mvnw liquibase:update"
+            mig_desc = "Apply Liquibase changelogs (they also run automatically at application start)."
+        else:
+            mig_cmd = "# no Flyway/Liquibase detected — schema managed by JPA (spring.jpa.hibernate.ddl-auto)"
+            mig_desc = "No migration tool detected — schema is managed by JPA/Hibernate at application start."
+    elif fw in ('express', 'nestjs'):
+        mig_cmd, mig_desc = "npm run db:migrate && npm run db:seed", "Execute database schema migrations and populate initial seed records."
+    else:
+        mig_cmd, mig_desc = "alembic upgrade head", "Execute database schema migrations and populate initial seed records."
     setup_steps.append({
         "step": step_num,
         "title": "Run Schema Migrations & Database Seeds",
-        "command": "npm run db:migrate && npm run db:seed" if fw in ('express', 'nestjs') else ("./mvnw compile exec:java" if fw == 'spring' else "alembic upgrade head"),
-        "description": "Execute database schema migrations and populate initial seed records."
+        "command": mig_cmd,
+        "description": mig_desc
     })
     step_num += 1
 
     # Step 5: Boot Application Development Server
+    if fw in ('spring', 'java'):
+        run_cmd = "./gradlew bootRun" if gradle else "./mvnw spring-boot:run"
+    elif fw in ('express', 'nestjs'):
+        run_cmd = "npm run dev"
+    else:
+        run_cmd = "uvicorn main:app --reload"
     setup_steps.append({
         "step": step_num,
         "title": "Launch Development Server",
-        "command": "npm run dev" if fw in ('express', 'nestjs') else ("./mvnw spring-boot:run" if fw == 'spring' else "uvicorn main:app --reload"),
+        "command": run_cmd,
         "description": "Start backend API in watch mode."
     })
 
@@ -2271,7 +2424,7 @@ def build_openapi_spec(data):
     swagger_schemas = data.get('swaggerSchemas', {})
 
     spec = {
-        "openapi": "3.0.0",
+        "openapi": swagger_schemas.get('openapi') or "3.0.0",
         "info": {
             "title": meta.get('displayName', 'SaaS MVP Platform API'),
             "version": meta.get('version', '1.0.0'),
@@ -2405,6 +2558,12 @@ def generate_html(data, target_dir=None):
 
     tech_stack = meta.get('techStack', {})
     total_endpoints = sum(len(m.get('endpoints', [])) for m in modules) + len(system_endpoints)
+    openapi_version = str(swagger_schemas.get('openapi') or '3.0.0')
+    openapi_short = '.'.join(openapi_version.split('.')[:2])
+    local_base_url = next((sv.get('url') for sv in swagger_schemas.get('servers', []) if sv.get('url')), 'http://localhost:3000')
+    messaging = data.get('messaging') or {}
+    msg_listeners = messaging.get('listeners', [])
+    msg_producers = messaging.get('producers', [])
     _all_eps = [ep for m in modules for ep in m.get('endpoints', [])] + list(system_endpoints)
     public_ep_count = sum(1 for ep in _all_eps if not ep.get('auth', False))
     auth_ep_count = sum(1 for ep in _all_eps if ep.get('auth', False))
@@ -3552,6 +3711,10 @@ def generate_html(data, target_dir=None):
                 <div class="nav-btn-left"><span>&#128452;</span> <span>SQL Queries</span></div>
                 <span class="nav-count">{len(sql_queries)}</span>
             </button>
+            {f'''<button class="nav-btn" onclick="showTab('messaging', this)">
+                <div class="nav-btn-left"><span>&#128227;</span> <span>Messaging</span></div>
+                <span class="nav-count">{len(msg_listeners) + len(msg_producers)}</span>
+            </button>''' if (msg_listeners or msg_producers) else ''}
             <button class="nav-btn" onclick="showTab('infra', this)">
                 <div class="nav-btn-left"><span>&#128187;</span> <span>Infrastructure</span></div>
                 <span class="nav-count">{len(infrastructure)}</span>
@@ -3565,7 +3728,7 @@ def generate_html(data, target_dir=None):
         </nav>
 
         <div class="sidebar-footer">
-           © AHMED EMAD - {html.escape(meta.get('displayName', 'Project MVP'))}
+           {html.escape(meta.get('displayName', 'Project'))} · generated by arch-wiki · {html.escape(meta.get('generatedAt', ''))}
         </div>
     </aside>
 
@@ -3908,7 +4071,7 @@ flowchart TD
             <div class="chead">
                 <span style="font-size:28px">&#9889;</span>
                 <div>
-                    <div class="card-title">Swagger & OpenAPI 3.0 API Specification & Explorer</div>
+                    <div class="card-title">Swagger & OpenAPI {html.escape(openapi_short)} API Specification & Explorer</div>
                     <div class="card-sub">Interactive REST API documentation generated from architecture manifest ({total_endpoints} Endpoints)</div>
                 </div>
                 <span class="badge badge-green" style="margin-left:auto; font-size: 12px; padding: 6px 12px;">STATUS: {html.escape(swagger_schemas.get('matchStatus', 'Verified Parity').upper())}</span>
@@ -3921,7 +4084,7 @@ flowchart TD
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Base URL</div>
-                    <code>http://localhost:3000</code>
+                    <code>{html.escape(local_base_url)}</code>
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Security Scheme</div>
@@ -3929,7 +4092,7 @@ flowchart TD
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Live Swagger Route</div>
-                    <code>{html.escape(swagger_schemas.get('servedAt', '/api/docs'))}</code>
+                    <code>{html.escape(swagger_schemas.get('servedAt') or '/api/docs')}</code>{f'<div style="margin-top:2px">UI: <code>{html.escape(swagger_schemas["swaggerUi"])}</code></div>' if swagger_schemas.get('swaggerUi') else ''}
                 </div>
             </div>
         </div>
@@ -3938,7 +4101,7 @@ flowchart TD
         <div style="display: flex; gap: 8px; margin-bottom: 16px;">
             <button class="sub-tab-btn active" onclick="switchSwaggerView('ui', this)">&#9889; Interactive Swagger UI</button>
             <button class="sub-tab-btn" onclick="switchSwaggerView('catalog', this)">&#128216; API Endpoint Catalog & cURL ({total_endpoints})</button>
-            <button class="sub-tab-btn" onclick="switchSwaggerView('json', this)">&#128220; OpenAPI 3.0 JSON Spec</button>
+            <button class="sub-tab-btn" onclick="switchSwaggerView('json', this)">&#128220; OpenAPI {html.escape(openapi_short)} JSON Spec</button>
         </div>
 
         <!-- Pane 1: Interactive Swagger UI -->
@@ -3984,7 +4147,7 @@ flowchart TD
             m_class = 'tg' if m == 'GET' else ('tb' if m == 'POST' else ('ty' if m in ['PUT','PATCH'] else 'tr'))
             curl_auth_header = ' -H "Authorization: Bearer $JWT_TOKEN"' if auth else ''
             curl_body = ' -H "Content-Type: application/json" -d \'{"key":"value"}\'' if m in ['POST','PUT','PATCH'] else ''
-            curl_cmd = f"curl -X {m} \"http://localhost:3000{full_path}\"{curl_auth_header}{curl_body}"
+            curl_cmd = f"curl -X {m} \"{local_base_url}{full_path}\"{curl_auth_header}{curl_body}"
 
             html_content += f"""
                     <div style="background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px;">
@@ -4014,7 +4177,7 @@ flowchart TD
         <div id="swagger-view-json" class="swagger-view-pane">
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                    <div style="font-weight: 600; font-size: 14px;">OpenAPI 3.0.0 JSON Specification Source</div>
+                    <div style="font-weight: 600; font-size: 14px;">OpenAPI {html.escape(openapi_version)} JSON Specification Source</div>
                     <button class="sub-tab-btn" onclick="navigator.clipboard.writeText(document.getElementById('swaggerOpenApiJsonSrc').textContent); alert('Copied OpenAPI JSON Spec to clipboard!');">&#128203; Copy OpenAPI Spec</button>
                 </div>
                 <pre style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: var(--font-code); font-size: 12px; color: var(--text); max-height: 600px; overflow-y: auto;"><code id="swaggerOpenApiJsonSrc">{html.escape(openapi_spec_json)}</code></pre>
@@ -4095,11 +4258,11 @@ flowchart TD
     html_content += """
     </div>
 
-    <!-- 6. SQL QUERIES CATALOG -->
+    <!-- 6. SQL QUERIES CATALOG (rendered lazily from embedded JSON) -->
     <div class="section" id="sec-sql">
         <div class="sec-title">&#128452; SQL Query Catalog & Repository Mapping</div>
         <p style="font-size: 13px; color: var(--muted); margin-bottom: 16px;">
-            Raw SQL statements mapped to repository/service functions, affected tables, and API endpoints.
+            Raw SQL / JPQL statements mapped to repository functions, affected tables, and API endpoints.
         </p>
 """
     if not sql_queries:
@@ -4111,39 +4274,69 @@ flowchart TD
         </div>
 """
     else:
-        html_content += """
-        <div class="grid1">
-"""
-        for q in sql_queries:
-            eps_html = ""
-            for ep in q.get('endpoints', []):
-                m = ep.get('method', 'GET').upper()
-                eps_html += f'<span class="method {m}">{m}</span> <code style="font-size:12px">{html.escape(ep.get("path",""))}</code> &nbsp; '
-
-            tables_html = " ".join([f'<span class="tag tg">{html.escape(tb)}</span>' for tb in q.get('tables', [])])
-
-            html_content += f"""
-            <div class="card">
-                <div class="chead" style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-                    <div class="card-title" style="color: var(--yellow);">&#9889; {html.escape(q.get('label', ''))}</div>
-                    <span class="tag tp" style="margin-left:auto">{html.escape(q.get('module', ''))} • {html.escape(q.get('function', ''))}</span>
-                </div>
-                <p style="font-size: 13px; color: var(--muted); margin: 6px 0;">
-                    <strong>Purpose:</strong> {html.escape(q.get('purpose', ''))}<br>
-                    <strong>File:</strong> <code>{html.escape(q.get('file', ''))}</code> | <strong>Tables:</strong> {tables_html}
-                </p>
-                <div style="margin: 8px 0; font-size: 12px;">
-                    <strong>Consuming Endpoints:</strong> {eps_html}
-                </div>
-                <div class="code-block">{html.escape(q.get('sql', ''))}</div>
-            </div>
-"""
-        html_content += """
+        sql_json = json.dumps(sql_queries, ensure_ascii=False).replace('</', '<\\/')
+        html_content += f"""
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+            <input id="sqlSearch" type="search" placeholder="Filter by table, function, file or SQL text…" oninput="sqlApplyFilter()"
+                   style="flex:1; min-width:240px; background:var(--bg2); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:13px;">
+            <span id="sqlCount" style="font-size:12px; color:var(--muted);"></span>
         </div>
+        <div class="grid1" id="sqlCatalogGrid"></div>
+        <div style="text-align:center; margin-top:16px;">
+            <button id="sqlMoreBtn" class="sub-tab-btn" onclick="sqlRenderMore()" style="display:none;">Load 50 more</button>
+        </div>
+        <script type="application/json" id="sqlCatalogData">{sql_json}</script>
 """
     html_content += """
     </div>
 
+    <!-- 6b. MESSAGING (only when listeners / producers were found) -->
+"""
+    if msg_listeners or msg_producers:
+        html_content += f"""
+    <div class="section" id="sec-messaging">
+        <div class="sec-title">&#128227; Messaging — Consumers &amp; Producers</div>
+        <p style="font-size: 13px; color: var(--muted); margin-bottom: 16px;">
+            Topics, queues and destinations discovered from @KafkaListener / @RabbitListener / @JmsListener and *Template.send() calls.
+        </p>
+        <div class="stats" style="margin-bottom: 20px;">
+            <div class="stat"><div class="stat-num">{len(msg_listeners)}</div><div class="stat-lbl">Listeners</div></div>
+            <div class="stat"><div class="stat-num">{len(msg_producers)}</div><div class="stat-lbl">Producers</div></div>
+            <div class="stat"><div class="stat-num">{len({t for l in msg_listeners for t in l.get('topics', [])} | {p.get('topic') for p in msg_producers if p.get('topic')})}</div><div class="stat-lbl">Topics / Queues</div></div>
+        </div>
+        <div class="sec-title" style="font-size:14px;">Consumers</div>
+        <div class="grid2">
+"""
+        for l in msg_listeners:
+            topics_html = "".join(f'<span class="tag ty">{html.escape(t)}</span>' for t in l.get('topics', [])) or '<span class="tag tq">(unresolved)</span>'
+            gid = f' · group <code>{html.escape(l["groupId"])}</code>' if l.get('groupId') else ''
+            html_content += f"""
+            <div class="card">
+                <div class="card-title">{html.escape(l.get('handler', ''))} <span class="tag tp">{html.escape(l.get('broker', ''))}</span></div>
+                <div class="card-sub" style="margin-bottom:8px;">{html.escape(l.get('file', ''))}{gid}</div>
+                <div>{topics_html}</div>
+            </div>
+"""
+        html_content += """
+        </div>
+        <div class="sec-title" style="font-size:14px; margin-top:20px;">Producers</div>
+        <div class="grid2">
+"""
+        for pr in msg_producers:
+            html_content += f"""
+            <div class="card">
+                <div class="card-title">{html.escape(pr.get('handler', ''))} <span class="tag tp">{html.escape(pr.get('broker', ''))}</span></div>
+                <div class="card-sub" style="margin-bottom:8px;">{html.escape(pr.get('file', ''))}</div>
+                <div><span class="tag tg">{html.escape(pr.get('topic', ''))}</span></div>
+            </div>
+"""
+        if not msg_producers:
+            html_content += '            <div style="font-size:13px; color:var(--muted);">No producers detected.</div>\n'
+        html_content += """
+        </div>
+    </div>
+"""
+    html_content += """
     <!-- 7. INFRASTRUCTURE -->
     <div class="section" id="sec-infra">
         <div class="sec-title">&#128187; Infrastructure Services</div>
@@ -4478,6 +4671,70 @@ flowchart TD
         }}
     }}
 
+    // ---- SQL catalog: rendered on first visit from the embedded JSON, 50 cards at a time ----
+    var SQL_PAGE = 50, sqlCatalog = null, sqlFiltered = [], sqlShown = 0;
+    function escHtml(v) {{
+        return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) {{
+            return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+        }});
+    }}
+    function sqlLoad() {{
+        if (sqlCatalog) return;
+        var el = document.getElementById('sqlCatalogData');
+        try {{ sqlCatalog = el ? JSON.parse(el.textContent) : []; }} catch (e) {{ console.error('SQL catalog JSON error', e); sqlCatalog = []; }}
+    }}
+    function sqlCard(q) {{
+        var eps = (q.endpoints || []).map(function(ep) {{
+            var m = (ep.method || 'GET').toUpperCase();
+            return '<span class="method ' + m + '">' + m + '</span> <code style="font-size:12px">' + escHtml(ep.path) + '</code> &nbsp; ';
+        }}).join('');
+        var tables = (q.tables || []).map(function(t) {{ return '<span class="tag tg">' + escHtml(t) + '</span>'; }}).join(' ');
+        var kind = q.queryType ? '<span class="tag ty" style="margin-left:6px">' + escHtml(q.queryType) + '</span>' : '';
+        return '<div class="card">' +
+            '<div class="chead" style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">' +
+                '<div class="card-title" style="color: var(--yellow);">&#9889; ' + escHtml(q.label) + kind + '</div>' +
+                '<span class="tag tp" style="margin-left:auto">' + escHtml(q.module) + (q.module && q.function ? ' • ' : '') + escHtml(q.function) + '</span>' +
+            '</div>' +
+            '<p style="font-size: 13px; color: var(--muted); margin: 6px 0;">' +
+                (q.purpose ? '<strong>Purpose:</strong> ' + escHtml(q.purpose) + '<br>' : '') +
+                '<strong>File:</strong> <code>' + escHtml(q.file) + '</code>' + (tables ? ' | <strong>Tables:</strong> ' + tables : '') +
+            '</p>' +
+            (eps ? '<div style="margin: 8px 0; font-size: 12px;"><strong>Consuming Endpoints:</strong> ' + eps + '</div>' : '') +
+            '<div class="code-block">' + escHtml(q.sql) + '</div>' +
+        '</div>';
+    }}
+    function sqlApplyFilter() {{
+        sqlLoad();
+        var q = ((document.getElementById('sqlSearch') || {{}}).value || '').toLowerCase();
+        sqlFiltered = !q ? sqlCatalog : sqlCatalog.filter(function(x) {{
+            return [x.label, x.module, x.function, x.file, (x.tables || []).join(' '), x.sql, x.queryType].join(' ').toLowerCase().indexOf(q) !== -1;
+        }});
+        var grid = document.getElementById('sqlCatalogGrid');
+        if (grid) grid.innerHTML = '';
+        sqlShown = 0;
+        sqlRenderMore();
+    }}
+    function sqlRenderMore(all) {{
+        var grid = document.getElementById('sqlCatalogGrid');
+        if (!grid) return;
+        var end = all ? sqlFiltered.length : Math.min(sqlFiltered.length, sqlShown + SQL_PAGE);
+        var buf = [];
+        for (var i = sqlShown; i < end; i++) buf.push(sqlCard(sqlFiltered[i]));
+        grid.insertAdjacentHTML('beforeend', buf.join(''));
+        sqlShown = end;
+        var more = document.getElementById('sqlMoreBtn');
+        if (more) more.style.display = sqlShown < sqlFiltered.length ? '' : 'none';
+        var count = document.getElementById('sqlCount');
+        if (count) count.textContent = 'Showing ' + sqlShown + ' of ' + sqlFiltered.length + (sqlCatalog && sqlFiltered.length !== sqlCatalog.length ? ' (filtered from ' + sqlCatalog.length + ')' : '');
+    }}
+    function renderSqlCatalog(all) {{
+        sqlLoad();
+        if (sqlShown === 0 || all) {{
+            if (all) {{ var g = document.getElementById('sqlCatalogGrid'); if (g) g.innerHTML = ''; sqlShown = 0; sqlFiltered = sqlCatalog; sqlRenderMore(true); }}
+            else sqlApplyFilter();
+        }}
+    }}
+
     function showTab(id, btn) {{
         document.querySelectorAll('.section').forEach(function(s) {{ s.classList.remove('active'); }});
         document.querySelectorAll('.nav-btn').forEach(function(b) {{ b.classList.remove('active'); }});
@@ -4490,6 +4747,8 @@ flowchart TD
             setTimeout(renderDockerDiagram, 50);
         }} else if (id === 'swagger') {{
             setTimeout(renderSwaggerUI, 50);
+        }} else if (id === 'sql') {{
+            setTimeout(function() {{ renderSqlCatalog(false); }}, 10);
         }}
     }}
 
@@ -4500,10 +4759,11 @@ flowchart TD
         var swaggerPanes = document.querySelectorAll('.swagger-view-pane');
         swaggerPanes.forEach(function(p) {{ p.style.display = 'block'; }});
 
-        // Pre-render diagrams and Swagger UI if not initialized yet
+        // Pre-render diagrams, Swagger UI and the full SQL catalog if not initialized yet
         if (typeof renderSysarchDiagram === 'function') renderSysarchDiagram();
         if (typeof renderDockerDiagram === 'function') renderDockerDiagram();
         if (typeof renderSwaggerUI === 'function') renderSwaggerUI();
+        if (typeof renderSqlCatalog === 'function') renderSqlCatalog(true);
 
         setTimeout(function() {{
             window.print();
@@ -4513,7 +4773,7 @@ flowchart TD
             if (activeBtn) {{
                 var onClickAttr = activeBtn.getAttribute('onclick');
                 if (onClickAttr) {{
-                    var match = onClickAttr.match(/showTab\('([^']+)'/);
+                    var match = onClickAttr.match(/showTab\\('([^']+)'/);
                     if (match) showTab(match[1], activeBtn);
                 }}
             }}
