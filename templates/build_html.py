@@ -603,6 +603,259 @@ def _scan_screens_java(root):
     return screens
 
 
+# ---------------------------------------------------------------------------
+# JAVA SOURCE HELPERS  (shared by the Spring route scanner and SQL extractor)
+# ---------------------------------------------------------------------------
+
+_JAVA_MODIFIERS = {'public', 'protected', 'private', 'static', 'final', 'abstract',
+                   'synchronized', 'native', 'default', 'strictfp', 'transient', 'volatile'}
+_JAVA_NOT_A_TYPE = _JAVA_MODIFIERS | {'return', 'new', 'throw', 'throws', 'else', 'if', 'while',
+                                      'for', 'switch', 'catch', 'try', 'do', 'case', 'super', 'this',
+                                      'instanceof', 'assert', 'yield', 'import', 'package'}
+
+def _java_lex(txt):
+    """Blank out comments (keeping offsets) and return (code, string_spans).
+
+    string_spans is a list of (start, end, value) for every "…" literal and
+    \"\"\"…\"\"\" text block, with value already unescaped / de-indented.
+    """
+    n = len(txt)
+    out = list(txt)
+    spans = []
+    i = 0
+    while i < n:
+        c = txt[i]
+        nxt = txt[i+1] if i + 1 < n else ''
+        if c == '/' and nxt == '/':
+            j = txt.find('\n', i)
+            j = n if j < 0 else j
+            for k in range(i, j): out[k] = ' '
+            i = j
+        elif c == '/' and nxt == '*':
+            j = txt.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != '\n': out[k] = ' '
+            i = j
+        elif c == '"' and txt.startswith('"""', i):
+            j = i + 3
+            while j < n:
+                if txt[j] == '\\': j += 2; continue
+                if txt.startswith('"""', j): break
+                j += 1
+            raw = txt[i+3:j]
+            spans.append((i, j + 3, _java_text_block(raw)))
+            i = j + 3
+        elif c == '"':
+            j = i + 1
+            while j < n and txt[j] != '"':
+                if txt[j] == '\\': j += 1
+                if txt[j] == '\n': break
+                j += 1
+            spans.append((i, j + 1, _java_unescape(txt[i+1:j])))
+            i = j + 1
+        elif c == "'":
+            j = i + 1
+            while j < n and txt[j] != "'" and txt[j] != '\n':
+                if txt[j] == '\\': j += 1
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return ''.join(out), spans
+
+def _java_unescape(s):
+    return (s.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+             .replace("\\'", "'").replace('\\\\', '\\'))
+
+def _java_text_block(raw):
+    """Strip the incidental indentation of a Java text block (JEP 378)."""
+    lines = raw.split('\n')
+    if lines and not lines[0].strip(): lines = lines[1:]
+    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    closing = lines[-1] if lines and not lines[-1].strip() else None
+    if closing is not None: indents.append(len(closing))
+    ind = min(indents) if indents else 0
+    lines = [l[ind:].rstrip() for l in lines]
+    return _java_unescape('\n'.join(lines)).strip('\n')
+
+def _in_string(pos, spans):
+    return any(s <= pos < e for s, e, _ in spans)
+
+def _balanced(code, open_idx, spans, opener='(', closer=')'):
+    """Index just past the bracket matching code[open_idx], skipping string contents."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        if _in_string(i, spans):
+            i += 1; continue
+        ch = code[i]
+        if ch == opener: depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0: return i + 1
+        i += 1
+    return n
+
+def _split_top_level(s):
+    """Split on commas that are not nested in (), {}, [] or a string."""
+    parts, depth, cur, in_str, esc = [], 0, [], None, False
+    for ch in s:
+        if in_str:
+            cur.append(ch)
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == in_str: in_str = None
+            continue
+        if ch in '"\'': in_str = ch
+        elif ch in '({[': depth += 1
+        elif ch in ')}]': depth -= 1
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(cur)); cur = []; continue
+        cur.append(ch)
+    if ''.join(cur).strip(): parts.append(''.join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+def _java_annotations(code, spans):
+    """Every annotation outside strings: dicts {name, args, kw, pos, start, end}.
+
+    kw maps attribute → raw expression; positional value stored under '' .
+    """
+    annos = []
+    for m in re.finditer(r'@([A-Za-z_][\w.]*)', code):
+        if _in_string(m.start(), spans): continue
+        name = m.group(1).split('.')[-1]
+        end = m.end()
+        args = ''
+        j = end
+        while j < len(code) and code[j] in ' \t': j += 1
+        if j < len(code) and code[j] == '(':
+            end = _balanced(code, j, spans)
+            args = code[j+1:end-1]
+        kw, pos = {}, []
+        for part in _split_top_level(args):
+            km = re.match(r'^([A-Za-z_]\w*)\s*=(?!=)\s*(.*)$', part, re.DOTALL)
+            if km: kw[km.group(1)] = km.group(2).strip()
+            else: pos.append(part)
+        if pos: kw[''] = pos[0]
+        annos.append({'name': name, 'args': args, 'kw': kw, 'pos': pos,
+                      'start': m.start(), 'end': end})
+    return annos
+
+def _string_values(expr, consts=None):
+    """String literals inside an annotation attribute value.
+
+    Handles "a", {"a", "b"}, "a" + "b" chains and simple constant references
+    resolved through `consts` (NAME or Class.NAME → value).
+    """
+    if expr is None: return []
+    expr = expr.strip()
+    if expr.startswith('{') and expr.endswith('}'):
+        return [v for part in _split_top_level(expr[1:-1]) for v in _string_values(part, consts)]
+    lits = re.findall(r'"((?:[^"\\]|\\.)*)"', expr)
+    if lits:
+        return [_java_unescape(''.join(lits))]
+    if consts:
+        key = expr.replace(' ', '')
+        if key in consts: return [consts[key]]
+        if key.split('.')[-1] in consts: return [consts[key.split('.')[-1]]]
+    return []
+
+def _java_string_consts(code):
+    """NAME → value for `static final String NAME = "…"` fields (and "a" + "b" chains)."""
+    consts = {}
+    for m in re.finditer(r'\bString\s+([A-Z_][A-Z0-9_]*)\s*=\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);', code):
+        consts[m.group(1)] = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)))
+    return consts
+
+_JAVA_METHOD_RE = re.compile(
+    r'(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)*'
+    r'(?:<[^>]*>\s*)?'                                   # generic method type params
+    r'([A-Za-z_][\w.]*(?:\s*<[^;{}()]*?>)?(?:\s*\[\s*\])*)'  # return type
+    r'\s+([A-Za-z_]\w*)\s*\(', re.DOTALL)
+
+def _java_method_after(code, pos, spans, limit=None):
+    """Name of the first method declared at or after `pos`, or None."""
+    limit = len(code) if limit is None else limit
+    for m in _JAVA_METHOD_RE.finditer(code, pos, limit):
+        if _in_string(m.start(), spans): continue
+        rtype, name = m.group(1).strip(), m.group(2)
+        if rtype.split('<')[0].split('.')[-1] in _JAVA_NOT_A_TYPE or name in _JAVA_NOT_A_TYPE: continue
+        if rtype in ('return',): continue
+        return name
+    return None
+
+def _java_methods(code, spans):
+    """[(start, name)] of every method/constructor-like declaration, in file order."""
+    out = []
+    for m in _JAVA_METHOD_RE.finditer(code):
+        if _in_string(m.start(), spans): continue
+        rtype, name = m.group(1).strip(), m.group(2)
+        head = rtype.split('<')[0].split('.')[-1]
+        if head in _JAVA_NOT_A_TYPE or name in _JAVA_NOT_A_TYPE: continue
+        # must be followed (after the parameter list) by '{', ';' or 'throws' — else it's a call
+        close = _balanced(code, m.end() - 1, spans)
+        tail = code[close:close+40].lstrip()
+        if not (tail.startswith('{') or tail.startswith(';') or tail.startswith('throws')): continue
+        out.append((m.start(), name))
+    return out
+
+def _java_type_name(code, spans):
+    """(name, decl_index) of the first top-level class/interface/record/enum."""
+    for m in re.finditer(r'\b(class|interface|record|enum)\s+([A-Za-z_]\w*)', code):
+        if not _in_string(m.start(), spans):
+            return m.group(2), m.start()
+    return None, len(code)
+
+def _join_path(base, sub):
+    full = '/' + '/'.join(p for p in (base or '').split('/') + (sub or '').split('/') if p)
+    return full
+
+def _common_path_prefix(paths):
+    segs = [[p for p in path.split('/') if p] for path in paths if path is not None]
+    if not segs: return '/'
+    prefix = segs[0]
+    for s in segs[1:]:
+        i = 0
+        while i < min(len(prefix), len(s)) and prefix[i] == s[i]: i += 1
+        prefix = prefix[:i]
+    return '/' + '/'.join(prefix)
+
+_SPRING_MAPPINGS = {'GetMapping': ['GET'], 'PostMapping': ['POST'], 'PutMapping': ['PUT'],
+                    'DeleteMapping': ['DELETE'], 'PatchMapping': ['PATCH'], 'RequestMapping': None}
+
+def _mapping_paths(anno, consts):
+    for key in ('', 'value', 'path'):
+        vals = _string_values(anno['kw'].get(key), consts)
+        if vals: return vals
+    return ['']
+
+def _mapping_methods(anno):
+    fixed = _SPRING_MAPPINGS.get(anno['name'])
+    if fixed: return fixed
+    found = re.findall(r'RequestMethod\.([A-Z]+)', anno['kw'].get('method', ''))
+    return found or ['GET']
+
+def _get_perm(annos):
+    for a in annos:
+        if a['name'] == 'PreAuthorize':
+            vals = _string_values(a['kw'].get('') or a['kw'].get('value'))
+            if vals: return vals[0]
+    for a in annos:
+        if a['name'] in ('RolesAllowed', 'Secured'):
+            vals = _string_values(a['kw'].get('') or a['kw'].get('value'))
+            if vals: return ' | '.join(vals)
+    return None
+
+def _get_summary(annos):
+    for a in annos:
+        if a['name'] == 'Operation':
+            for key in ('summary', 'description'):
+                vals = _string_values(a['kw'].get(key))
+                if vals and vals[0].strip(): return vals[0].strip()
+    return None
+
 def _scan_java_spring(root, arch_type=None):
     if not arch_type:
         arch_type = _detect_arch_type(root, 'spring')
@@ -616,16 +869,21 @@ def _scan_java_spring(root, arch_type=None):
         for f in fls:
             if f.endswith('.java'):
                 files.append(os.path.join(r, f))
+    by_class = {os.path.basename(f)[:-5]: f for f in files}
 
     mod_map = {}
     for rf in sorted(files):
         txt = open(rf, encoding='utf-8', errors='ignore').read()
         if not ('@RestController' in txt or '@Controller' in txt):
             continue
+        code, spans = _java_lex(txt)
+        annos = _java_annotations(code, spans)
+        if not any(a['name'] in ('RestController', 'Controller') for a in annos):
+            continue
 
         fn = os.path.basename(rf)
         raw_name = fn.replace('Controller.java', '').replace('.java', '')
-        
+
         rel = os.path.relpath(rf, root).replace('\\', '/')
         top_folder = rel.split('/')[0] if '/' in rel else raw_name.lower()
         is_monolith = (arch_type == 'monolith') or (top_folder in ('src', 'main', 'java', 'app', 'backend', 'server', '.'))
@@ -636,93 +894,66 @@ def _scan_java_spring(root, arch_type=None):
         else:
             mid = top_folder
             svc_title = mid.replace('-service', '').replace('_service', '').replace('-', ' ').title()
-
         name = svc_title
 
-        bp_match = re.search(r'public\s+class\s+\w+[\s\S]*', txt)
-        header_part = txt[:bp_match.start()] if bp_match else txt
-        bp_m = re.search(r'@RequestMapping\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']+)["\']', header_part)
+        # Constants usable in mapping paths: this file plus any `Other.CONST` references
+        consts = _java_string_consts(code)
+        for ref in set(re.findall(r'\b([A-Z][A-Za-z0-9_]*)\.([A-Z_][A-Z0-9_]*)\b', code)):
+            other = by_class.get(ref[0])
+            if other and other != rf:
+                oc, _ = _java_lex(open(other, encoding='utf-8', errors='ignore').read())
+                for k, v in _java_string_consts(oc).items():
+                    consts.setdefault(f"{ref[0]}.{k}", v)
 
-        if is_monolith:
-            base_path = bp_m.group(1) if bp_m else f"/{raw_name.lower()}"
-        else:
-            base_path = bp_m.group(1) if bp_m else (f"/{raw_name.lower()}" if mid != top_folder else f"/{top_folder.replace('-service','')}")
+        class_name, class_pos = _java_type_name(code, spans)
+        class_annos = [a for a in annos if a['start'] < class_pos]
+        member_annos = [a for a in annos if a['start'] >= class_pos]
 
-        if not base_path.startswith('/'):
-            base_path = '/' + base_path
+        class_bases = ['']
+        for a in class_annos:
+            if a['name'] == 'RequestMapping':
+                class_bases = _mapping_paths(a, consts)
+                break
+        class_perm = _get_perm(class_annos)
+        tag_desc = None
+        for a in class_annos:
+            if a['name'] == 'Tag':
+                vals = _string_values(a['kw'].get('description'))
+                if vals: tag_desc = vals[0].strip()
+        file_auth = ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt
+                     or 'RolesAllowed' in txt or 'Secured' in txt or 'Authentication' in txt)
 
-        eps = []
-        seen = set()
+        # Group member annotations into runs: consecutive annotations separated only by whitespace
+        runs, cur = [], []
+        for a in member_annos:
+            if cur and code[cur[-1]['end']:a['start']].strip():
+                runs.append(cur); cur = []
+            cur.append(a)
+        if cur: runs.append(cur)
 
-        def _get_perm(snip):
-            pm = re.search(r'@PreAuthorize\s*\(\s*"([^"]+)"\s*\)', snip) or re.search(r"@PreAuthorize\s*\(\s*'([^']+)'\s*\)", snip)
-            return pm.group(1) if pm else None
-
-        mapping_pats = [
-            ('GET', r'@GetMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('POST', r'@PostMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('PUT', r'@PutMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('DELETE', r'@DeleteMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('PATCH', r'@PatchMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-        ]
-
-        for method, pat in mapping_pats:
-            for m in re.finditer(pat, txt):
-                ep_path = m.group(1) if (m.lastindex and m.group(1)) else '/'
-                if not ep_path:
-                    ep_path = '/'
-                
-                start_idx = max(0, m.start() - 250)
-                snippet = txt[start_idx:m.start()]
-                perm = _get_perm(snippet)
-                
-                key_ep = f"{method}:{ep_path}"
-                if key_ep not in seen:
-                    seen.add(key_ep)
-                    eps.append({
-                        'method': method,
-                        'path': ep_path,
-                        'auth': ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt or 'RolesAllowed' in txt),
-                        'permission': perm,
-                        'description': _infer_desc(method, ep_path, name)
-                    })
-
-        for m in re.finditer(r'(@PreAuthorize\s*\([^)]+\)\s*|@RolesAllowed\s*\([^)]+\)\s*)?@RequestMapping\s*\(([^)]+)\)', txt):
-            full_anno = m.group(0)
-            pre_auth = m.group(1)
-            params = m.group(2)
-            
-            if bp_match and m.start() < bp_match.start():
-                continue
-
-            meth_match = re.search(r'method\s*=\s*RequestMethod\.([A-Z]+)', params)
-            method = meth_match.group(1) if meth_match else 'GET'
-
-            path_match = re.search(r'(?:path|value)\s*=\s*["\']([^"\']*)["\']', params)
-            if not path_match:
-                path_match = re.search(r'["\']([^"\']*)["\']', params)
-            ep_path = path_match.group(1) if path_match else '/'
-            if not ep_path:
-                ep_path = '/'
-
-            perm = None
-            if pre_auth:
-                perm = _get_perm(pre_auth)
-            if not perm:
-                start_idx = max(0, m.start() - 250)
-                snippet = txt[start_idx:m.start()]
-                perm = _get_perm(snippet)
-
-            key_ep = f"{method}:{ep_path}"
-            if key_ep not in seen:
-                seen.add(key_ep)
-                eps.append({
-                    'method': method,
-                    'path': ep_path,
-                    'auth': ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt or 'RolesAllowed' in txt or perm is not None),
-                    'permission': perm,
-                    'description': _infer_desc(method, ep_path, name)
-                })
+        eps, seen = [], set()
+        for run in runs:
+            mappings = [a for a in run if a['name'] in _SPRING_MAPPINGS]
+            if not mappings: continue
+            perm = _get_perm(run) or class_perm
+            summary = _get_summary(run)
+            handler = _java_method_after(code, run[-1]['end'], spans)
+            for mp in mappings:
+                for method in _mapping_methods(mp):
+                    for base in class_bases:
+                        for sub in _mapping_paths(mp, consts):
+                            full = _join_path(base, sub)
+                            key_ep = f"{method}:{full}"
+                            if key_ep in seen: continue
+                            seen.add(key_ep)
+                            eps.append({
+                                'method': method,
+                                'path': full,          # re-relativised against the module basePath below
+                                'auth': file_auth or perm is not None,
+                                'permission': perm,
+                                'description': summary or _infer_desc(method, sub or '/', name),
+                                'handler': f"{class_name or raw_name}.{handler}" if handler else None,
+                            })
 
         # Find matching screens/templates for this module
         mod_screens = []
@@ -733,30 +964,52 @@ def _scan_java_spring(root, arch_type=None):
             if raw_low in sn or raw_low in sp or mid in sp:
                 mod_screens.append(scr['path'])
 
-        if eps or True:
-            perms = list(set(e['permission'] for e in eps if e.get('permission')))
-            if mid in mod_map:
-                if rel not in mod_map[mid]['files'] and fn not in mod_map[mid]['files']:
-                    mod_map[mid]['files'].append(rel)
-                mod_map[mid]['endpoints'].extend(eps)
-                mod_map[mid]['permissions'] = list(set(mod_map[mid]['permissions'] + perms))
-                for ms in mod_screens:
-                    if ms not in mod_map[mid]['files']:
-                        mod_map[mid]['files'].append(ms)
-                mod_map[mid]['description'] = f"{mod_map[mid]['name']} — {len(mod_map[mid]['endpoints'])} endpoint(s)"
-            else:
-                files_list = [rel] + mod_screens
-                mod_map[mid] = {
-                    'id': mid,
-                    'name': name if is_monolith else f"{svc_title} Service",
-                    'basePath': base_path,
-                    'description': f"{svc_title} module — {len(eps)} endpoint(s)" if is_monolith else f"{svc_title} microservice — {len(eps)} endpoint(s)",
-                    'color': _color(mid, len(mod_map)),
-                    'icon': _icon(mid),
-                    'files': files_list,
-                    'permissions': perms,
-                    'endpoints': eps
-                }
+        perms = list(set(e['permission'] for e in eps if e.get('permission')))
+        if mid in mod_map:
+            m = mod_map[mid]
+            if rel not in m['files'] and fn not in m['files']:
+                m['files'].append(rel)
+            existing = set(f"{e['method']}:{e['path']}" for e in m['endpoints'])
+            m['endpoints'].extend(e for e in eps if f"{e['method']}:{e['path']}" not in existing)
+            m['permissions'] = list(set(m['permissions'] + perms))
+            m['_bases'].extend(class_bases)
+            for ms in mod_screens:
+                if ms not in m['files']:
+                    m['files'].append(ms)
+            if tag_desc and not m.get('_tagDesc'):
+                m['_tagDesc'] = tag_desc
+        else:
+            mod_map[mid] = {
+                'id': mid,
+                'name': name if is_monolith else f"{svc_title} Service",
+                'basePath': '/',
+                'description': '',
+                'color': _color(mid, len(mod_map)),
+                'icon': _icon(mid),
+                'files': [rel] + mod_screens,
+                'permissions': perms,
+                'endpoints': eps,
+                '_bases': list(class_bases),
+                '_tagDesc': tag_desc,
+                '_monolith': is_monolith,
+                '_title': svc_title,
+            }
+
+    # Module basePath = longest common prefix of its controllers' class-level paths,
+    # endpoint paths relative to it — so basePath + path is always the real route.
+    for m in mod_map.values():
+        bp = _common_path_prefix([_join_path(b, '') for b in m.pop('_bases')])
+        m['basePath'] = bp
+        for e in m['endpoints']:
+            rel_path = e['path'][len(bp):] if bp != '/' and e['path'].startswith(bp) else e['path']
+            e['path'] = rel_path or '/'
+        n = len(m['endpoints'])
+        tag_desc = m.pop('_tagDesc', None)
+        title = m.pop('_title')
+        if m.pop('_monolith'):
+            m['description'] = f"{tag_desc or title + ' module'} — {n} endpoint(s)"
+        else:
+            m['description'] = f"{tag_desc or title + ' microservice'} — {n} endpoint(s)"
 
     if arch_type != 'monolith':
         pom_path = os.path.join(root, 'pom.xml')

@@ -191,11 +191,21 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
       "path": "/path",
       "auth": true,
       "permission": "module:read or null",
-      "description": "What this endpoint does"
+      "description": "What this endpoint does",
+      "handler": "ControllerClass.methodName (optional, filled by the Spring scanner)"
     }
   ]
 }
 ```
+
+> [!NOTE]
+> **Spring:** the scanner parses every path of a mapping annotation (`@RequestMapping({"/a", "/b"})`,
+> `value = {...}`, `path =` in any attribute position, `method = {POST, PUT}`) and emits one endpoint
+> per class-level base × method path. A module's `basePath` is the longest common prefix of its
+> controllers' class-level mappings and every endpoint `path` is relative to it, so
+> `basePath + path` is always the real route. `@Operation(summary)` becomes the description,
+> `@Tag(description)` the module description; `@PreAuthorize` / `@RolesAllowed` / `@Secured` are
+> read anywhere in the method's annotation block, falling back to the class-level annotation.
 
 #### 8. `permissions`
 Keep `catalog` array sorted by module prefix.

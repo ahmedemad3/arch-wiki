@@ -116,3 +116,82 @@ def test_java_build_info_maven_and_groovy(build_html, tmp_path):
     (catalog / 'gradle' / 'libs.versions.toml').write_text('[versions]\nspring-boot = "3.5.1"\njava = "21"\n')
     info = build_html._java_build_info(str(catalog))
     assert (info['javaVersion'], info['springBootVersion']) == ('21', '3.5.1')
+
+
+def test_spring_routes_multi_path_and_permissions(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    mods = {m['id']: m for m in build_html._scan_java_spring(root)}
+    assert sorted(mods) == ['billing', 'users']
+
+    billing, users = mods['billing'], mods['users']
+    # Module basePath is the common prefix of its controllers; endpoint paths are relative to it.
+    assert billing['basePath'] == '/api' and users['basePath'] == '/api'
+    assert billing['description'].startswith('Invoice lifecycle and lookup')  # from @Tag
+
+    data = {'modules': [billing, users]}
+    got = sorted(endpoints(data))
+    inv = ['/api/v1/invoices', '/api/v2/invoices']
+    expected = []
+    for b in inv:
+        expected += [('GET', f'{b}/customer/{{customerId}}'), ('GET', f'{b}/{{id}}'), ('GET', f'{b}/by-id/{{id}}'),
+                     ('POST', b), ('POST', f'{b}/{{id}}/void'), ('PUT', f'{b}/{{id}}/void')]
+    expected += [('GET', '/api/v1/payments'), ('GET', '/api/v1/payments/{id}'), ('POST', '/api/v1/payments/{id}/refund'),
+                 ('GET', '/api/public/ping'), ('GET', '/api/v1/users'), ('GET', '/api/v1/users/me'),
+                 ('DELETE', '/api/v1/users/{id}'), ('PATCH', '/api/v1/users/{id}/roles')]
+    assert got == sorted(expected)
+    assert len(got) == 20
+
+    idx = endpoint_index(data)
+    # path= after produces=, @PreAuthorize before the mapping, @Operation summary
+    ep = idx[('GET', '/api/v1/invoices/customer/{customerId}')]
+    assert ep['description'] == 'List invoices for a customer'
+    assert ep['permission'] == "hasAuthority('billing.invoice.view')"
+    assert ep['handler'] == 'InvoiceController.byCustomer'
+    # value={…} array, @PreAuthorize AFTER the mapping, @Operation after that
+    ep = idx[('GET', '/api/v2/invoices/by-id/{id}')]
+    assert ep['description'] == 'Get one invoice'
+    assert ep['permission'].startswith("hasAuthority('billing.invoice.view') and @billingAuth")
+    # @RequestMapping with method={POST, PUT} and produces=
+    assert idx[('PUT', '/api/v1/invoices/{id}/void')]['permission'] is None
+    # class-level @PreAuthorize applies to un-annotated methods, method-level overrides
+    assert idx[('GET', '/api/v1/payments/{id}')]['permission'] == "hasAuthority('billing.payment.view')"
+    assert idx[('POST', '/api/v1/payments/{id}/refund')]['permission'] == "hasRole('FINANCE')"
+    # class @RequestMapping(path=…, produces=…)
+    assert idx[('GET', '/api/v1/users/me')]['permission'] is None
+    assert idx[('GET', '/api/public/ping')]['auth'] is False
+    assert idx[('GET', '/api/v1/users')]['auth'] is True
+
+
+def test_spring_scanner_ignores_comments_and_resolves_constants(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java'
+    src.mkdir(parents=True)
+    (src / 'Paths.java').write_text('public final class Paths { public static final String ORDERS = "/api/orders"; }')
+    (src / 'OrderController.java').write_text('''
+        @RestController
+        @RequestMapping(Paths.ORDERS)
+        public class OrderController {
+            private static final String BY_ID = "/{id}";
+            // @GetMapping("/commented-out")
+            /* @PostMapping("/also-commented") */
+            @GetMapping(BY_ID) public Object one(@PathVariable Long id) { return "@GetMapping(\\"/in-a-string\\")"; }
+            @DeleteMapping(value = BY_ID, produces = "application/json") public void del(@PathVariable Long id) {}
+        }
+    ''')
+    mods = build_html._scan_java_spring(str(tmp_path), arch_type='monolith')
+    assert len(mods) == 1
+    assert mods[0]['basePath'] == '/api/orders'
+    assert sorted((e['method'], e['path']) for e in mods[0]['endpoints']) == [('DELETE', '/{id}'), ('GET', '/{id}')]
+
+
+def test_spring_no_class_mapping_has_no_fabricated_base(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java'
+    src.mkdir(parents=True)
+    (src / 'HealthController.java').write_text('''
+        @RestController
+        public class HealthController {
+            @GetMapping("/actuator/ping") public String ping() { return "ok"; }
+        }
+    ''')
+    mods = build_html._scan_java_spring(str(tmp_path), arch_type='monolith')
+    assert mods[0]['basePath'] == '/'
+    assert mods[0]['endpoints'][0]['path'] == '/actuator/ping'
