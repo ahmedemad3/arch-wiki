@@ -698,10 +698,13 @@ def _balanced(code, open_idx, spans, opener='(', closer=')'):
         i += 1
     return n
 
-def _split_top_level(s):
-    """Split on commas that are not nested in (), {}, [] or a string."""
-    parts, depth, cur, in_str, esc = [], 0, [], None, False
-    for ch in s:
+def _split_top_level(s, with_offsets=False):
+    """Split on commas that are not nested in (), {}, [] or a string.
+
+    With with_offsets=True returns [(part, offset_of_part_in_s)].
+    """
+    parts, depth, cur, in_str, esc, start = [], 0, [], None, False, 0
+    for i, ch in enumerate(s):
         if in_str:
             cur.append(ch)
             if esc: esc = False
@@ -712,10 +715,15 @@ def _split_top_level(s):
         elif ch in '({[': depth += 1
         elif ch in ')}]': depth -= 1
         elif ch == ',' and depth == 0:
-            parts.append(''.join(cur)); cur = []; continue
+            parts.append((''.join(cur), start)); cur = []; start = i + 1; continue
         cur.append(ch)
-    if ''.join(cur).strip(): parts.append(''.join(cur))
-    return [p.strip() for p in parts if p.strip()]
+    parts.append((''.join(cur), start))
+    out = []
+    for part, off in parts:
+        stripped = part.strip()
+        if not stripped: continue
+        out.append((stripped, off + (len(part) - len(part.lstrip()))))
+    return out if with_offsets else [p for p, _ in out]
 
 def _java_annotations(code, spans):
     """Every annotation outside strings: dicts {name, args, kw, pos, start, end}.
@@ -733,15 +741,29 @@ def _java_annotations(code, spans):
         if j < len(code) and code[j] == '(':
             end = _balanced(code, j, spans)
             args = code[j+1:end-1]
-        kw, pos = {}, []
-        for part in _split_top_level(args):
+        kw, pos, kw_span = {}, [], {}
+        args_off = j + 1 if args else end
+        for part, off in _split_top_level(args, with_offsets=True):
             km = re.match(r'^([A-Za-z_]\w*)\s*=(?!=)\s*(.*)$', part, re.DOTALL)
-            if km: kw[km.group(1)] = km.group(2).strip()
-            else: pos.append(part)
+            if km:
+                kw[km.group(1)] = km.group(2).strip()
+                kw_span[km.group(1)] = (args_off + off + km.start(2), args_off + off + len(part))
+            else:
+                pos.append(part)
+                if not kw_span.get(''):
+                    kw_span[''] = (args_off + off, args_off + off + len(part))
         if pos: kw[''] = pos[0]
-        annos.append({'name': name, 'args': args, 'kw': kw, 'pos': pos,
+        annos.append({'name': name, 'args': args, 'kw': kw, 'pos': pos, 'kw_span': kw_span,
                       'start': m.start(), 'end': end})
     return annos
+
+def _anno_literal(anno, key, spans):
+    """Concatenated string-literal value of an annotation attribute, read from the lexer spans
+    so text blocks and escapes are handled. Returns None when the attribute is absent."""
+    if key not in anno['kw_span']: return None
+    a, b = anno['kw_span'][key]
+    parts = [v for s, e, v in spans if a <= s and e <= b]
+    return ''.join(parts) if parts else None
 
 def _string_values(expr, consts=None):
     """String literals inside an annotation attribute value.
@@ -1035,6 +1057,169 @@ def _scan_java_spring(root, arch_type=None):
                     }
 
     return list(mod_map.values())
+
+# ---------------------------------------------------------------------------
+# SQL EXTRACTOR (Java)
+# Real queries from the source tree instead of per-endpoint placeholders:
+#   • @Query / @NativeQuery / @NamedQuery / @NamedNativeQuery (JPQL vs native)
+#   • string literals, text blocks and "…" + "…" chains that start with
+#     SELECT / INSERT / UPDATE / DELETE / WITH / MERGE (JdbcTemplate, EntityManager…)
+# Each query is attributed to its enclosing class + method; tables come from
+# FROM / JOIN / INTO / UPDATE. Endpoints are left empty rather than guessed.
+# ---------------------------------------------------------------------------
+
+_SQL_START_RE = re.compile(r'^\s*\(?\s*(SELECT|INSERT|UPDATE|DELETE|WITH|MERGE)\b', re.IGNORECASE)
+_SQL_SHAPE = {  # a statement must also carry the clause that makes it SQL, not prose
+    'SELECT': r'\bFROM\b|^\s*\(?\s*SELECT\s+(?:\d|[\w.]+\s*\(|\*)',
+    'INSERT': r'\bINTO\b', 'UPDATE': r'\bSET\b', 'DELETE': r'\bFROM\b',
+    'WITH': r'\bAS\s*\(', 'MERGE': r'\bINTO\b',
+}
+
+def _looks_like_sql(text):
+    m = _SQL_START_RE.match(text)
+    return bool(m) and bool(re.search(_SQL_SHAPE[m.group(1).upper()], text, re.IGNORECASE | re.DOTALL))
+_SQL_QUERY_ANNOS = {'Query': 'jpql', 'NativeQuery': 'native', 'NamedQuery': 'jpql', 'NamedNativeQuery': 'native'}
+
+def _sql_tables(sql, jpql=False):
+    """Table (or JPQL entity) names referenced after FROM / JOIN / INTO / UPDATE."""
+    s = re.sub(r"'(?:[^']|'')*'", "''", sql)                                   # drop string literals
+    s = re.sub(r'\b(?:EXTRACT|SUBSTRING|TRIM|POSITION|OVERLAY)\s*\([^()]*\)', ' ', s, flags=re.IGNORECASE)
+    tables = []
+    pat = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+(?:ONLY\s+|LATERAL\s+)?(?!SELECT\b|\(|VALUES\b)'
+                     r'([`"\[]?[A-Za-z_][\w$]*[`"\]]?(?:\.[`"\[]?[A-Za-z_][\w$]*[`"\]]?)*)', re.IGNORECASE)
+    for m in pat.finditer(s):
+        t = re.sub(r'[`"\[\]]', '', m.group(1))
+        if jpql and '.' in t: continue                                          # i.customer path expressions
+        if t.upper() in ('DUAL', 'SET', 'WHERE', 'SELECT', 'UNNEST', 'GENERATE_SERIES', 'JSON_TABLE'): continue
+        if t not in tables: tables.append(t)
+    return tables
+
+def _java_brace_depths(code, spans):
+    """Brace depth before each character (strings ignored). Cheap enough: one pass per file."""
+    depths = [0] * (len(code) + 1)
+    d = 0
+    for i, ch in enumerate(code):
+        depths[i] = d
+        if _in_string(i, spans): continue
+        if ch == '{': d += 1
+        elif ch == '}': d -= 1
+    depths[len(code)] = d
+    return depths
+
+def _sql_module_for(rel, modules):
+    """Best-effort module name for a Java file: directory of a module file, top folder, or package."""
+    for m in modules or []:
+        for f in m.get('files', []):
+            d = os.path.dirname(f)
+            if d and rel.startswith(d + '/'): return m['name']
+    top = rel.split('/')[0]
+    for m in modules or []:
+        if m['id'] == top: return m['name']
+    pkg = re.search(r'/(?:java|kotlin)/(.+)/[^/]+\.java$', '/' + rel)
+    if pkg:
+        segs = pkg.group(1).split('/')
+        for seg in reversed(segs):
+            for m in modules or []:
+                if m['id'] == seg.lower(): return m['name']
+        return segs[-1].replace('_', ' ').title()
+    return ''
+
+def _scan_sql_java(root, modules=None):
+    queries = []
+    seen = set()
+    for r, _, fls in os.walk(root):
+        norm_r = r.replace('\\', '/')
+        if any(x in norm_r for x in ['/target/', '/.idea/', '/build/', '/.git/', '/test/', '/node_modules/']):
+            continue
+        for f in sorted(fls):
+            if not f.endswith('.java'): continue
+            rf = os.path.join(r, f)
+            txt = open(rf, encoding='utf-8', errors='ignore').read()
+            if not re.search(r'@(?:Native|Named)?(?:Native)?Query\b|\b(?:SELECT|INSERT|UPDATE|DELETE|WITH|MERGE)\b', txt, re.IGNORECASE):
+                continue
+            rel = os.path.relpath(rf, root).replace('\\', '/')
+            code, spans = _java_lex(txt)
+            if not spans: continue
+            class_name, _ = _java_type_name(code, spans)
+            class_name = class_name or f[:-5]
+            methods = _java_methods(code, spans)
+            depths = _java_brace_depths(code, spans)
+            module = _sql_module_for(rel, modules)
+            consumed = []
+
+            def _add(sql, kind, function, extra_purpose):
+                sql = sql.strip()
+                if not sql: return
+                key = (rel, function, sql)
+                if key in seen: return
+                seen.add(key)
+                tables = _sql_tables(sql, jpql=(kind == 'jpql'))
+                verb = re.match(r'\s*\(?\s*(\w+)', sql).group(1).upper()
+                target = tables[0] if tables else class_name
+                queries.append({
+                    'label': f"{verb} {target}",
+                    'module': module,
+                    'function': function,
+                    'purpose': extra_purpose,
+                    'file': rel,
+                    'queryType': kind,
+                    'tables': tables,
+                    'endpoints': [],
+                    'sql': sql,
+                })
+
+            # 1. @Query-family annotations → the method declared right after them
+            for a in _java_annotations(code, spans):
+                if a['name'] not in _SQL_QUERY_ANNOS: continue
+                consumed.append((a['start'], a['end']))
+                kind = _SQL_QUERY_ANNOS[a['name']]
+                native_attr = a['kw'].get('nativeQuery', '').strip().lower()
+                if native_attr == 'true': kind = 'native'
+                sql = None
+                for key in ('', 'value', 'query'):
+                    sql = _anno_literal(a, key, spans)
+                    if sql: break
+                if not sql: continue
+                meth = next((n for s, n in methods if s >= a['end']), None)
+                function = f"{class_name}.{meth}()" if meth else class_name
+                purpose = ("Native SQL declared with @Query(nativeQuery = true)" if kind == 'native'
+                           else "JPQL query declared with @Query")
+                if a['name'] in ('NamedQuery', 'NamedNativeQuery'):
+                    nm = _anno_literal(a, 'name', spans) or ''
+                    function = f"{class_name}@{nm}" if nm else class_name
+                    purpose = f"{'Native' if kind == 'native' else 'JPQL'} named query on entity {class_name}"
+                _add(sql, kind, function, purpose)
+
+            # 2. Free-standing literal chains that look like SQL
+            chains, cur = [], []
+            for sp in sorted(spans):
+                if any(cs <= sp[0] < ce for cs, ce in consumed): continue
+                if cur and re.fullmatch(r'\s*\+\s*', code[cur[-1][1]:sp[0]]):
+                    cur.append(sp)
+                else:
+                    if cur: chains.append(cur)
+                    cur = [sp]
+            if cur: chains.append(cur)
+            for ch in chains:
+                sql = ''.join(v for _, _, v in ch)
+                if not _looks_like_sql(sql): continue
+                start = ch[0][0]
+                before = code[max(0, start - 120):start]
+                if re.search(r'createNativeQuery\s*\(\s*$', before): kind = 'native'
+                elif re.search(r'createQuery\s*\(\s*$', before): kind = 'jpql'
+                else: kind = 'sql'
+                if depths[start] <= 1:
+                    fm = re.search(r'String\s+([A-Za-z_]\w*)\s*=\s*$', before)
+                    function = f"{class_name}.{fm.group(1)}" if fm else class_name
+                    purpose = "SQL constant declared as a class field"
+                else:
+                    meth = next((n for s, n in reversed(methods) if s < start), None)
+                    function = f"{class_name}.{meth}()" if meth else class_name
+                    purpose = {'native': "Native SQL passed to EntityManager.createNativeQuery",
+                               'jpql': "JPQL passed to EntityManager.createQuery"}.get(
+                               kind, "SQL string literal executed from application code")
+                _add(sql, kind, function, purpose)
+    return queries
 
 def _scan_workspaces(root):
     ws = []
@@ -1373,8 +1558,12 @@ def _build_data_flow(fw, core_layer):
 # architecture.json INITIALISER — now powered by codebase scanner
 # ---------------------------------------------------------------------------
 
-def init_architecture(target_root=None):
-    """Scan the codebase and generate architecture.json automatically."""
+def init_architecture(target_root=None, placeholder_sql=False):
+    """Scan the codebase and generate architecture.json automatically.
+
+    placeholder_sql=True restores the legacy per-endpoint SQL placeholders for
+    Java projects instead of extracting real @Query / SQL literals.
+    """
     if not target_root:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         root = _find_root(script_dir)
@@ -1480,6 +1669,73 @@ def init_architecture(target_root=None):
     # 8. Core Layer & SQL Queries
     core_layer = _scan_core_layer(root, fw)
 
+    if fw in ('spring', 'java') and not placeholder_sql:
+        sql_queries = _scan_sql_java(root, modules)
+        print(f"[arch-wiki] SQL: {len(sql_queries)} quer{'y' if len(sql_queries) == 1 else 'ies'} extracted from Java sources")
+    else:
+        sql_queries = _placeholder_sql(modules, fw)
+
+    db_name = next((s['image'].split(':')[0].split('/')[-1].title()
+                    for s in infrastructure if s['type']=='database'), 'PostgreSQL')
+
+    today = datetime.date.today().isoformat()
+    total_ep_str = f"{total_ep}/{total_ep}"
+
+    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces, java_info)
+
+    scaffold = {
+        "meta": {
+            "displayName": display_name,
+            "version": "1.0.0",
+            "description": proj_desc or f"{display_name} REST API",
+            "generatedAt": today,
+            "techStack": {
+                "language": fw_info['language'],
+                "framework": fw_info['framework'],
+                "database": db_name,
+                "auth": "JWT / Bearer Token"
+            }
+        },
+        "prerequisites": prerequisites,
+        "workspaces": workspaces,
+        "infrastructure": infrastructure,
+        "dockerDiagram": docker_diagram,
+        "systemArchitectureDiagram": sys_diag,
+        "swaggerSchemas": {
+            "matchStatus": f"Verified Parity ({total_ep_str} Endpoints)",
+            "openapi": "3.0.0",
+            "servedAt": "/api/docs",
+            "securityScheme": "bearerAuth (JWT Bearer Token)",
+            "servers": [
+                {"url": "http://localhost:3000", "description": "Local Development Server"},
+                {"url": f"https://api.{display_name.lower().replace(' ','-')}.com", "description": "Production"}
+            ],
+            "schemas": []
+        },
+        "modules": modules,
+        "systemEndpoints": [
+            {"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}
+        ],
+        "coreLayer": core_layer,
+        "dataFlow": _build_data_flow(fw, core_layer),
+        "permissions": {
+            "description": "RBAC permission catalog and endpoint mapping.",
+            "catalog": all_perms,
+            "details": perm_details
+        },
+        "sqlQueries": sql_queries
+    }
+
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(scaffold, f, indent=2)
+
+    print(f"[arch-wiki] Generated architecture.json -> {json_path}")
+    return scaffold
+
+
+def _placeholder_sql(modules, fw):
+    """Legacy catalog: one templated statement per endpoint (tables are guessed from the
+    module id / last path segment). Kept for non-Java frameworks and --placeholder-sql."""
     sql_queries = []
     for mod in modules:
         mname = mod['name']
@@ -1563,62 +1819,7 @@ def init_architecture(target_root=None):
                 "sql": sql_stmt
             })
 
-    db_name = next((s['image'].split(':')[0].split('/')[-1].title()
-                    for s in infrastructure if s['type']=='database'), 'PostgreSQL')
-
-    today = datetime.date.today().isoformat()
-    total_ep_str = f"{total_ep}/{total_ep}"
-
-    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces, java_info)
-
-    scaffold = {
-        "meta": {
-            "displayName": display_name,
-            "version": "1.0.0",
-            "description": proj_desc or f"{display_name} REST API",
-            "generatedAt": today,
-            "techStack": {
-                "language": fw_info['language'],
-                "framework": fw_info['framework'],
-                "database": db_name,
-                "auth": "JWT / Bearer Token"
-            }
-        },
-        "prerequisites": prerequisites,
-        "workspaces": workspaces,
-        "infrastructure": infrastructure,
-        "dockerDiagram": docker_diagram,
-        "systemArchitectureDiagram": sys_diag,
-        "swaggerSchemas": {
-            "matchStatus": f"Verified Parity ({total_ep_str} Endpoints)",
-            "openapi": "3.0.0",
-            "servedAt": "/api/docs",
-            "securityScheme": "bearerAuth (JWT Bearer Token)",
-            "servers": [
-                {"url": "http://localhost:3000", "description": "Local Development Server"},
-                {"url": f"https://api.{display_name.lower().replace(' ','-')}.com", "description": "Production"}
-            ],
-            "schemas": []
-        },
-        "modules": modules,
-        "systemEndpoints": [
-            {"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}
-        ],
-        "coreLayer": core_layer,
-        "dataFlow": _build_data_flow(fw, core_layer),
-        "permissions": {
-            "description": "RBAC permission catalog and endpoint mapping.",
-            "catalog": all_perms,
-            "details": perm_details
-        },
-        "sqlQueries": sql_queries
-    }
-
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(scaffold, f, indent=2)
-
-    print(f"[arch-wiki] Generated architecture.json -> {json_path}")
-    return scaffold
+    return sql_queries
 
 
 def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
@@ -4208,7 +4409,7 @@ if __name__ == '__main__':
             print(f"[arch-wiki] Syncing codebase changes with architecture.json at {json_path}...")
         else:
             print(f"[arch-wiki] Initializing fresh architecture manifest at {json_path}...")
-        data = init_architecture(target_path)
+        data = init_architecture(target_path, placeholder_sql='--placeholder-sql' in sys.argv)
     else:
         data = load_architecture(json_path)
 

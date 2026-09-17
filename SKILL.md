@@ -77,6 +77,20 @@ If missing, ensure directory `docs/architecture` exists and copy `build_html.py`
   ```
   *Re-scans codebase for new endpoints, permissions, and SQL queries, updates `architecture.json`, and rebuilds `architecture.html`.*
 
+- **SQL catalog for Java / Spring projects:** `sqlQueries` is extracted from the sources —
+  `@Query` / `@NativeQuery` / `@NamedQuery` (JPQL vs `nativeQuery = true`), Java text blocks,
+  and `"…" + "…"` string chains that start with `SELECT` / `INSERT` / `UPDATE` / `DELETE` /
+  `WITH` / `MERGE` (JdbcTemplate, EntityManager, …). Each query is attributed to its enclosing
+  class and method (`function`), gets a `queryType` of `jpql` | `native` | `sql`, and its
+  `tables` from `FROM` / `JOIN` / `INTO` / `UPDATE`. `endpoints` is left empty rather than
+  guessed — fill it by hand or through the override hook when you know the mapping.
+  The legacy behaviour (one templated statement per endpoint, referencing guessed table names)
+  is available with:
+  ```bash
+  python docs/architecture/build_html.py --init --placeholder-sql
+  ```
+  Express / NestJS / FastAPI projects keep the placeholder catalog unchanged.
+
 > [!NOTE]
 > The codebase scanner automatically excludes build artifacts (`dist/`, `build/`, `node_modules/`)
 > to prevent duplicate route modules and sanitizes diagram nodes for error-free Mermaid rendering.
@@ -239,6 +253,7 @@ Catalog mapping raw SQL statements or query builders to repository functions and
   "function": "RepositoryClass.methodName()",
   "tables": ["table1", "table2"],
   "purpose": "Detailed explanation of what the query accomplishes",
+  "queryType": "sql | jpql | native  (set by the Java extractor; optional otherwise)",
   "sql": "SELECT ... FROM table1 JOIN table2 ...",
   "endpoints": [
     { "method": "GET", "path": "/api/v1/module/resource" }

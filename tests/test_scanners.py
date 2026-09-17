@@ -195,3 +195,64 @@ def test_spring_no_class_mapping_has_no_fabricated_base(build_html, tmp_path):
     mods = build_html._scan_java_spring(str(tmp_path), arch_type='monolith')
     assert mods[0]['basePath'] == '/'
     assert mods[0]['endpoints'][0]['path'] == '/actuator/ping'
+
+
+# ---------------------------------------------------------------- SQL
+
+def test_spring_sql_catalog_is_extracted_not_invented(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    data = build_html.init_architecture(root)
+    q = {x['function']: x for x in data['sqlQueries']}
+    assert len(data['sqlQueries']) == 6
+    assert all(x['endpoints'] == [] for x in data['sqlQueries'])
+    assert all(x['module'] == 'Billing Service' for x in data['sqlQueries'])
+
+    assert q['InvoiceRepository.findByCustomer()']['queryType'] == 'jpql'
+    assert q['InvoiceRepository.findByCustomer()']['tables'] == ['Invoice']          # i.customer path skipped
+    native = q['InvoiceRepository.findWithCustomerByStatus()']
+    assert native['queryType'] == 'native'
+    assert native['tables'] == ['billing.invoice', 'billing.customer']
+    assert native['sql'].startswith('SELECT inv.*, cust.name\nFROM billing.invoice inv')  # text block de-indented
+    assert q['InvoiceRepository.voidById()']['tables'] == ['billing.invoice']
+
+    chain = q['PaymentReportDao.monthlyTotals()']
+    assert chain['queryType'] == 'sql'
+    assert chain['tables'] == ['billing.payment']                                    # EXTRACT(... FROM paid_at) ignored
+    assert 'GROUP BY 1 ORDER BY 1' in chain['sql']
+    # dense single-line `@Transactional public int archive(...){...} public String label(){...}`
+    assert q['PaymentReportDao.archive()']['tables'] == ['billing.payment_archive', 'billing.payment']
+    assert q['PaymentReportDao.purge()']['sql'].startswith('DELETE FROM billing.payment_archive')
+    assert 'PaymentReportDao.label()' not in q
+    assert all('not sql' not in x['sql'] for x in data['sqlQueries'])
+
+
+def test_placeholder_sql_flag_restores_legacy_catalog(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    data = build_html.init_architecture(root, placeholder_sql=True)
+    assert len(data['sqlQueries']) == 20  # one per endpoint
+    assert all(x['endpoints'] for x in data['sqlQueries'])
+
+
+def test_sql_field_constants_and_entity_manager(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java'
+    src.mkdir(parents=True)
+    (src / 'ReportDao.java').write_text('''
+        @Repository
+        public class ReportDao {
+            private static final String TOTALS = "SELECT customer_id, SUM(total) FROM invoice GROUP BY customer_id";
+            @PersistenceContext private EntityManager em;
+
+            public List<Object[]> totals() { return em.createNativeQuery(TOTALS).getResultList(); }
+
+            public List<Invoice> open() {
+                return em.createQuery("SELECT i FROM Invoice i WHERE i.status = 'OPEN'", Invoice.class).getResultList();
+            }
+
+            public String greeting() { return "select is not a query here"; }
+        }
+    ''')
+    qs = build_html._scan_sql_java(str(tmp_path))
+    by_fn = {q['function']: q for q in qs}
+    assert set(by_fn) == {'ReportDao.TOTALS', 'ReportDao.open()'}
+    assert by_fn['ReportDao.TOTALS']['tables'] == ['invoice']
+    assert by_fn['ReportDao.open()']['queryType'] == 'jpql'
