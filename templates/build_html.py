@@ -231,59 +231,208 @@ def _detect_fw(root):
                 except: pass
     return 'unknown'
 
+try:
+    import yaml as _yaml
+except ImportError:  # PyYAML is optional — the line-based parser below is the fallback
+    _yaml = None
+
+# Ordered: first match on the image basename (then the service name) wins.
+_SERVICE_TYPE_HINTS = [
+    ('monitoring', ['kafka-ui', 'kafdrop', 'redpanda-console', 'pgadmin', 'adminer', 'mongo-express',
+                    'redis-commander', 'redisinsight', 'prometheus', 'grafana', 'jaeger', 'zipkin', 'otel',
+                    'opentelemetry', 'tempo', 'loki', 'alertmanager', 'cadvisor', 'exporter', 'datadog',
+                    'sentry', 'glitchtip', 'signoz', 'monitoring']),
+    ('uptime',     ['uptime-kuma', 'uptime']),
+    ('logging',    ['elasticsearch', 'opensearch', 'kibana', 'logstash', 'fluentd', 'fluent-bit', 'graylog', 'seq']),
+    ('search',     ['meilisearch', 'typesense', 'solr', 'search']),
+    ('database',   ['postgres', 'pgvector', 'timescale', 'mysql', 'mariadb', 'mongo', 'mssql', 'sqlserver',
+                    'oracle', 'cockroach', 'cassandra', 'scylla', 'clickhouse', 'neo4j', 'couchdb', 'dynamodb',
+                    'influx', 'questdb', 'db2', 'database', '-db']),
+    ('cache',      ['redis', 'valkey', 'memcached', 'keydb', 'dragonfly', 'hazelcast', 'cache']),
+    ('queue',      ['kafka', 'redpanda', 'zookeeper', 'rabbitmq', 'nats', 'activemq', 'artemis', 'pulsar',
+                    'mosquitto', 'emqx', 'broker', 'queue']),
+    ('auth',       ['keycloak', 'authentik', 'hydra', 'kratos', 'zitadel', 'dex', 'authelia', 'fusionauth',
+                    'logto', 'oauth2-proxy', 'auth']),
+    ('mail',       ['mailpit', 'mailhog', 'maildev', 'mailcatcher', 'greenmail', 'inbucket', 'postfix', 'smtp', 'mail']),
+    ('voice',      ['asterisk', 'freeswitch', 'kamailio', 'opensips', 'coturn', 'rtpengine', 'jitsi', 'janus',
+                    'mediasoup', 'livekit', 'sip', 'voice', 'pbx']),
+    ('proxy',      ['nginx', 'traefik', 'haproxy', 'caddy', 'envoy', 'kong', 'apisix', 'tyk', 'cloudflared',
+                    'ngrok', 'gateway', 'ingress', 'proxy']),
+    ('storage',    ['minio', 'localstack', 'azurite', 'ceph', 'garage', 'sftp', 'ftp', 's3', 'blob', 'storage']),
+    ('registry',   ['registry', 'eureka', 'consul', 'nacos']),
+    ('config',     ['config', 'vault', 'etcd']),
+]
+
+def _infer_service_type(name, image):
+    """Service type from the image basename (quay.io/keycloak/keycloak:26 → keycloak), then the name."""
+    base = (image or '').split('/')[-1].split(':')[0].split('@')[0].lower()
+    for cand in (base, (name or '').lower()):
+        if not cand: continue
+        for stype, keys in _SERVICE_TYPE_HINTS:
+            if any(k in cand for k in keys):
+                return stype
+    if re.fullmatch(r'(?:.*[-_])?db(?:[-_].*)?', (name or '').lower()):   # db, app-db, db_primary
+        return 'database'
+    return 'app'
+
+def _compose_port(entry):
+    """Published host port from any compose `ports:` form, else the container port, else None.
+
+    Handles 5432, "5432", "5432:5432", "127.0.0.1:8080:8080", "[::1]:8080:8080",
+    "8080-8081:8080-8081", "9092:9092/udp" and the long {target, published} syntax."""
+    def _first(v):
+        m = re.match(r'\s*(\d+)', str(v))
+        return int(m.group(1)) if m else None
+    if isinstance(entry, bool) or entry is None: return None
+    if isinstance(entry, int): return entry
+    if isinstance(entry, dict):
+        return _first(entry.get('published')) or _first(entry.get('target'))
+    s = str(entry).strip().strip('"\'')
+    s = re.sub(r'/(?:tcp|udp|sctp)$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^\[[^\]]*\]:', 'ipv6:', s)              # [::1]:8080:80 → ipv6:8080:80
+    parts = s.split(':')
+    if len(parts) == 1: return _first(parts[0])
+    if len(parts) == 2: return _first(parts[0])
+    return _first(parts[-2])                              # host:published:target
+
+def _compose_env(raw):
+    """environment: as a dict, from either mapping or ["K=V", …] list form."""
+    env = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            env[str(k)] = '' if v is None else str(v)
+    elif isinstance(raw, list):
+        for item in raw:
+            k, _, v = str(item).partition('=')
+            env[k.strip()] = v.strip()
+    return env
+
+def _parse_compose_yaml(path):
+    """docker-compose services via PyYAML → {name: {image, build, ports, depends, profiles, env}}."""
+    class _Loader(_yaml.SafeLoader):
+        pass
+    # unknown tags (!reset, !override) must not abort the scan
+    _Loader.add_multi_constructor('!', lambda loader, suffix, node: None)
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        doc = _yaml.load(f, Loader=_Loader) or {}
+    services = doc.get('services') if isinstance(doc, dict) else None
+    if not isinstance(services, dict): return {}
+    svcs = {}
+    for sn, sv in services.items():
+        if not isinstance(sv, dict): sv = {}
+        build = sv.get('build')
+        if isinstance(build, dict): build = build.get('context', '.')
+        ports = [p for p in (_compose_port(e) for e in (sv.get('ports') or [])) if p]
+        deps_raw = sv.get('depends_on') or []
+        deps = list(deps_raw.keys()) if isinstance(deps_raw, dict) else [str(d) for d in deps_raw]
+        profiles = sv.get('profiles') or []
+        svcs[str(sn)] = {
+            'image': str(sv.get('image') or ''),
+            'build': str(build or ''),
+            'ports': ports,
+            'depends': [str(d) for d in deps],
+            'profiles': [str(p) for p in (profiles if isinstance(profiles, list) else [profiles])],
+            'env': _compose_env(sv.get('environment')),
+        }
+    return svcs
+
+def _parse_compose_lines(lines):
+    """Fallback parser used when PyYAML is not installed (2-space indented block style only)."""
+    svcs, cur = {}, None
+    in_svc, in_dep = False, False
+    dep_indent = 0
+
+    for ln in lines:
+        s = ln.rstrip()
+        if not s or s.startswith('#'): continue
+
+        if re.match(r'^[a-zA-Z0-9_\-]+:', s):
+            in_svc = s.startswith('services:')
+            cur = None; in_dep = False
+            continue
+        if not in_svc: continue
+
+        m = re.match(r'^  ([a-zA-Z0-9_\-]+):\s*$', s)
+        if m:
+            cur = m.group(1)
+            svcs[cur] = {'image':'','ports':[],'depends':[],'build':'','profiles':[],'env':{}}
+            in_dep = False; continue
+        if not cur: continue
+
+        if re.match(r'^\s+image:\s+', s): svcs[cur]['image'] = s.split('image:')[1].strip()
+        if re.match(r'^\s+context:\s+', s): svcs[cur]['build'] = s.split('context:')[1].strip()
+        pm = re.match(r'^\s+ports:\s*\[(.*)\]\s*$', s)
+        if pm:
+            for item in pm.group(1).split(','):
+                p = _compose_port(item.strip())
+                if p: svcs[cur]['ports'].append(p)
+        pm = re.match(r'^\s+-\s*["\']?([\d.:\[\]a-fA-F\-]+(?:/\w+)?)["\']?\s*$', s)
+        if pm and not in_dep:
+            p = _compose_port(pm.group(1))
+            if p: svcs[cur]['ports'].append(p)
+        pf = re.match(r'^\s+profiles:\s*\[(.*)\]', s)
+        if pf: svcs[cur]['profiles'] = [x.strip().strip('"\'') for x in pf.group(1).split(',') if x.strip()]
+
+        dm_start = re.match(r'^(\s+)depends_on:\s*(\[.*\])?\s*$', s)
+        if dm_start:
+            if dm_start.group(2):
+                svcs[cur]['depends'] = [x.strip().strip('"\'') for x in dm_start.group(2)[1:-1].split(',') if x.strip()]
+                continue
+            in_dep = True
+            dep_indent = len(dm_start.group(1))
+            continue
+
+        if in_dep:
+            curr_indent = len(s) - len(s.lstrip())
+            if curr_indent <= dep_indent and not s.strip().startswith('-'):
+                in_dep = False
+            else:
+                dm_list = re.match(r'^\s+-\s*([a-zA-Z0-9_\-]+)', s)
+                dm_map = re.match(r'^\s+([a-zA-Z0-9_\-]+):\s*$', s)
+                dep_target = None
+                if dm_list:
+                    dep_target = dm_list.group(1)
+                elif dm_map:
+                    dep_target = dm_map.group(1)
+
+                if dep_target and dep_target not in ('condition', 'service_healthy', 'service_started', 'environment', 'logging', 'ports', 'image', 'restart', 'build'):
+                    if dep_target not in svcs[cur]['depends']:
+                        svcs[cur]['depends'].append(dep_target)
+    return svcs
+
+_ENV_LINK_KEY_RE = re.compile(r'HOST|URL|URI|UPSTREAM|BROKERS?|SERVERS?|ADDR|ENDPOINT', re.IGNORECASE)
+
+def _env_links(svc_name, env, all_names):
+    """(target, env_key) pairs for env values that point at another compose service by hostname."""
+    links = []
+    for key, val in (env or {}).items():
+        if not val: continue
+        for other in all_names:
+            if other == svc_name: continue
+            tok = re.escape(other)
+            host_ref = (re.search(rf'(?<![\w.-]){tok}:\d+', val)                   # svc:port
+                        or re.search(rf'//{tok}(?![\w-])', val)                   # scheme://svc
+                        or re.search(rf'@{tok}(?![\w-])', val))                    # user:pw@svc
+            if not host_ref and _ENV_LINK_KEY_RE.search(key):
+                host_ref = re.search(rf'(?<![\w.-]){tok}(?![\w-])', val)           # MAIL_HOST=svc
+            if host_ref:
+                links.append((other, key))
+                break
+    return links
+
 def _scan_docker(root):
     for name in ['docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml']:
         path = os.path.join(root, name)
         if not os.path.isfile(path): continue
-        lines = open(path, encoding='utf-8', errors='ignore').read().splitlines()
-        svcs, cur = {}, None
-        in_svc, in_dep = False, False
-        dep_indent = 0
-
-        for ln in lines:
-            s = ln.rstrip()
-            if not s or s.startswith('#'): continue
-
-            if re.match(r'^[a-zA-Z0-9_\-]+:', s):
-                in_svc = s.startswith('services:')
-                cur = None; in_dep = False
-                continue
-            if not in_svc: continue
-
-            m = re.match(r'^  ([a-zA-Z0-9_\-]+):\s*$', s)
-            if m:
-                cur = m.group(1)
-                svcs[cur] = {'image':'','ports':[],'depends':[],'build':''}
-                in_dep = False; continue
-            if not cur: continue
-
-            if re.match(r'^\s+image:\s+', s): svcs[cur]['image'] = s.split('image:')[1].strip()
-            if re.match(r'^\s+context:\s+', s): svcs[cur]['build'] = s.split('context:')[1].strip()
-            pm = re.match(r'^\s+-\s*["\']?(\d+):(\d+)["\']?', s)
-            if pm: svcs[cur]['ports'].append(int(pm.group(1)))
-
-            dm_start = re.match(r'^(\s+)depends_on:', s)
-            if dm_start:
-                in_dep = True
-                dep_indent = len(dm_start.group(1))
-                continue
-
-            if in_dep:
-                curr_indent = len(s) - len(s.lstrip())
-                if curr_indent <= dep_indent and not s.strip().startswith('-'):
-                    in_dep = False
-                else:
-                    dm_list = re.match(r'^\s+-\s*([a-zA-Z0-9_\-]+)', s)
-                    dm_map = re.match(r'^\s+([a-zA-Z0-9_\-]+):\s*$', s)
-                    dep_target = None
-                    if dm_list:
-                        dep_target = dm_list.group(1)
-                    elif dm_map:
-                        dep_target = dm_map.group(1)
-                    
-                    if dep_target and dep_target not in ('condition', 'service_healthy', 'service_started', 'environment', 'logging', 'ports', 'image', 'restart', 'build'):
-                        if dep_target not in svcs[cur]['depends']:
-                            svcs[cur]['depends'].append(dep_target)
+        svcs = {}
+        if _yaml is not None:
+            try:
+                svcs = _parse_compose_yaml(path)
+            except Exception as ex:
+                print(f"[arch-wiki] WARN: PyYAML could not parse {name} ({ex}); using line parser")
+                svcs = {}
+        if not svcs:
+            svcs = _parse_compose_lines(open(path, encoding='utf-8', errors='ignore').read().splitlines())
 
         all_svcs = list(svcs.keys())
         for sn, sv in svcs.items():
@@ -292,31 +441,42 @@ def _scan_docker(root):
                 for db in [f"{prefix}-mongodb", f"{prefix}-db", f"{prefix}-postgres", f"{prefix}-mysql"]:
                     if db in svcs and db not in sv['depends']:
                         sv['depends'].append(db)
-            
+
             if sn == 'gateway':
                 for target_svc in all_svcs:
                     if target_svc.endswith('-service') and target_svc not in sv['depends']:
                         sv['depends'].append(target_svc)
 
-        hints = {'postgres':'database','mysql':'database','mongo':'database','redis':'cache',
-                 'rabbitmq':'queue','kafka':'queue','nginx':'proxy','gateway':'proxy','traefik':'proxy',
-                 'prometheus':'monitoring','grafana':'monitoring','monitoring':'monitoring',
-                 'elasticsearch':'logging','registry':'registry','config':'config',
-                 'minio':'storage','s3':'storage','blob':'storage'}
         infra, nodes, edges = [], [], []
+        edge_seen = set()
         for sn, sv in svcs.items():
-            t = next((v for k,v in hints.items() if k in sn.lower() or k in sv['image'].lower()), 'app')
+            t = _infer_service_type(sn, sv['image'])
             port = sv['ports'][0] if sv['ports'] else None
-            infra.append({'id':sn,'name':sn.replace('-',' ').replace('_',' ').title(),'type':t,
+            optional = bool(sv.get('profiles'))
+            desc = f"{sn} container"
+            if optional:
+                desc += f" (profile: {', '.join(sv['profiles'])} — optional)"
+            entry = {'id':sn,'name':sn.replace('-',' ').replace('_',' ').title(),'type':t,
                 'image':sv['image'] or f"build:{sv['build']}",
-                'port':port,'description':f"{sn} container",'features':[]})
-            nodes.append({'id':sn,'label':f"{sn}{':%d'%port if port else ''}",
-                'type':t,'port':port})
+                'port':port,'description':desc,'features':[]}
+            node = {'id':sn,'label':f"{sn}{':%d'%port if port else ''}",'type':t,'port':port}
+            if optional:
+                entry['optional'] = True; entry['profiles'] = list(sv['profiles'])
+                node['optional'] = True
+            if len(sv['ports']) > 1:
+                entry['ports'] = list(sv['ports'])
+            infra.append(entry)
+            nodes.append(node)
             for dep in sv['depends']:
-                if dep in svcs: edges.append({'from':sn,'to':dep,'label':''})
-        return infra, {'description':f"Topology from {name}.","nodes":nodes,"edges":edges}
+                if dep in svcs and (sn, dep) not in edge_seen:
+                    edge_seen.add((sn, dep))
+                    edges.append({'from':sn,'to':dep,'label':'','kind':'depends_on'})
+            for target, key in _env_links(sn, sv.get('env'), all_svcs):
+                if (sn, target) not in edge_seen:
+                    edge_seen.add((sn, target))
+                    edges.append({'from':sn,'to':target,'label':key,'kind':'env'})
+        return infra, {'description':f"Topology from {name}. Solid arrows: depends_on; labelled arrows: runtime links found in environment values.","nodes":nodes,"edges":edges}
     return [], {'description':'','nodes':[],'edges':[]}
-
 def _infer_desc(method, path, mod):
     has_id = bool(re.search(r':[^/]+|\{[^}]+\}', path))
     segs = [p for p in path.split('/') if p and not p.startswith(':') and not p.startswith('{')]
@@ -1414,7 +1574,7 @@ def _build_sys_diagram(modules, infrastructure):
         
     data_nodes = []
     for s in infrastructure:
-        if s.get('type') in ('database', 'cache', 'queue', 'storage'):
+        if s.get('type') in ('database', 'cache', 'queue', 'storage', 'auth', 'mail', 'search'):
             data_nodes.append({'id': s['id'], 'label': f"{s['name']}{(' :%s'%s.get('port')) if s.get('port') else ''}", 'type': s.get('type')})
     if not data_nodes:
         data_nodes.append({'id': 'db', 'label': 'PostgreSQL Database', 'type': 'database'})
@@ -1432,7 +1592,8 @@ def _build_sys_diagram(modules, infrastructure):
             
     for an in api_nodes:
         for dn in data_nodes:
-            lbl = 'Store / Fetch' if dn.get('type') == 'storage' else ('Cache / PubSub' if dn.get('type') == 'cache' else 'Query')
+            lbl = {'storage': 'Store / Fetch', 'cache': 'Cache / PubSub', 'queue': 'Publish / Consume',
+                   'auth': 'OIDC / JWT', 'mail': 'SMTP', 'search': 'Index / Search'}.get(dn.get('type'), 'Query')
             edges.append({'from': an['id'], 'to': dn['id'], 'label': lbl})
             
     return {'description': 'System architecture, module boundaries, and infrastructure component relationships.',
@@ -1877,11 +2038,11 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
         sname = s.get('name', 'Service')
         simg  = s.get('image', 'latest')
         sport = s.get('port')
-        if stype in ('database', 'cache', 'queue', 'monitoring'):
+        if stype in ('database', 'cache', 'queue', 'monitoring', 'auth', 'mail', 'search', 'storage'):
             tools.append({
                 "name": f"{sname} ({stype.title()})",
                 "version": simg,
-                "required": True if stype in ('database', 'cache') else False,
+                "required": stype in ('database', 'cache', 'auth') and not s.get('optional'),
                 "category": stype,
                 "description": f"Containerized {stype} service running on port {sport or 'internal'}."
             })
@@ -1994,6 +2155,14 @@ def clean_mermaid(text):
     if not text:
         return ""
     return re.sub(r'[^a-zA-Z0-9 _\-\.:]', '', str(text))
+
+_MERMAID_EXTRA_CLASSDEFS = """    classDef auth fill:#312e81,stroke:#a5b4fc,stroke-width:2px,color:#fff;
+    classDef mail fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#fff;
+    classDef voice fill:#4a044e,stroke:#e879f9,stroke-width:2px,color:#fff;
+    classDef storage fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#fff;
+    classDef search fill:#365314,stroke:#a3e635,stroke-width:2px,color:#fff;
+    classDef registry fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#fff;
+    classDef config fill:#3f3f46,stroke:#d4d4d8,stroke-width:2px,color:#fff;"""
 
 def build_openapi_spec(data):
     meta = data.get('meta', {})
@@ -3506,7 +3675,7 @@ flowchart TB
     classDef queue fill:#4c1d95,stroke:#8b5cf6,stroke-width:2px,color:#fff;
     classDef monitoring fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff;
     classDef logging fill:#831843,stroke:#ec4899,stroke-width:2px,color:#fff;
-
+{_MERMAID_EXTRA_CLASSDEFS}
 """
     sys_type_map = {}
     for sg in system_arch_diagram.get('subgraphs', []):
@@ -3586,7 +3755,7 @@ flowchart TD
     classDef monitoring fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff;
     classDef logging fill:#831843,stroke:#ec4899,stroke-width:2px,color:#fff;
     classDef uptime fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#fff;
-
+{_MERMAID_EXTRA_CLASSDEFS}
 """
         type_map = {}
         for node in docker_diagram.get('nodes', []):
@@ -3613,6 +3782,9 @@ flowchart TD
         for t_name, n_ids in type_map.items():
             if n_ids:
                 html_content += f"    class {','.join(n_ids)} {t_name};\n"
+        for node in docker_diagram.get('nodes', []):
+            if node.get('optional'):
+                html_content += f"    style {clean_mermaid(node['id'])} stroke-dasharray: 6 4\n"
 
         html_content += """
                 </script>
@@ -3864,12 +4036,16 @@ flowchart TD
         <div class="sec-title">&#128187; Infrastructure Services</div>
         <div class="grid3">
 """
-    tc_map = {'database':'tb', 'cache':'tg', 'queue':'ty', 'proxy':'tq', 'monitoring':'tp', 'logging':'tr', 'uptime':'tr'}
+    tc_map = {'database':'tb', 'cache':'tg', 'queue':'ty', 'proxy':'tq', 'monitoring':'tp', 'logging':'tr', 'uptime':'tr',
+              'auth':'tp', 'mail':'ty', 'voice':'tr', 'storage':'tb', 'search':'tg', 'registry':'tq', 'config':'tq'}
     for s in infrastructure:
         t_cls = tc_map.get(s.get('type'), 'tq')
-        ports = f" : {s.get('port')}" if s.get('port') else ""
+        all_ports = s.get('ports') or ([s.get('port')] if s.get('port') else [])
+        ports = f" : {', '.join(str(p) for p in all_ports)}" if all_ports else ""
         mgmt = f" (mgmt: {s.get('managementPort')})" if s.get('managementPort') else ""
         feats = "".join([f'<span class="tag tq">{html.escape(f)}</span>' for f in s.get('features', [])])
+        if s.get('optional'):
+            feats += f'<span class="tag ty" title="Only started with --profile">optional · profile: {html.escape(", ".join(s.get("profiles", [])))}</span>'
 
         html_content += f"""
             <div class="card">

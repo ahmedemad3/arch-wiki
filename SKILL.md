@@ -127,13 +127,22 @@ Add a new entry for each Docker container/service:
 {
   "id": "service-id",
   "name": "Display Name + version",
-  "type": "database|cache|queue|proxy|monitoring|logging|uptime",
+  "type": "app|database|cache|queue|auth|mail|voice|proxy|monitoring|logging|uptime|search|storage|registry|config",
   "image": "docker-image:tag",
   "port": 1234,
+  "ports": [1234, 1235],
+  "optional": true,
+  "profiles": ["dev"],
   "description": "What it does in this system",
   "features": ["feature 1", "feature 2"]
 }
 ```
+`ports` / `optional` / `profiles` are only present when relevant. The scanner uses **PyYAML when
+installed** (`pip install pyyaml`) and understands every `ports:` form (`"5432:5432"`, flow lists,
+`"127.0.0.1:8080:8080"`, ranges, `/udp`, long `target/published` syntax), `profiles:` (→ `optional`),
+`depends_on` in list and map form, and YAML anchors. Without PyYAML a simpler line parser handles
+2-space-indented block-style files. Types are inferred from the image name (`keycloak` → auth,
+`kafka` → queue, `mailpit` → mail, `asterisk` → voice, `nginx` → proxy, `prometheus` → monitoring, …).
 
 #### 4. `dockerDiagram`
 Extracted from `docker-compose.yml` for rendering the container topology Mermaid diagram:
@@ -141,13 +150,17 @@ Extracted from `docker-compose.yml` for rendering the container topology Mermaid
 {
   "description": "Container topology extracted from docker-compose.yml. Arrows represent network dependencies.",
   "nodes": [
-    { "id": "node_id", "label": "Container Name", "type": "app|database|cache|queue|proxy|monitoring|logging|uptime", "port": 3000 }
+    { "id": "node_id", "label": "Container Name", "type": "app|database|cache|queue|auth|mail|voice|proxy|monitoring|logging|uptime|search|storage|registry|config", "port": 3000, "optional": false }
   ],
   "edges": [
-    { "from": "api", "to": "postgres", "label": "TCP 5432" }
+    { "from": "api", "to": "postgres", "label": "TCP 5432", "kind": "depends_on" },
+    { "from": "api", "to": "keycloak", "label": "KEYCLOAK_ISSUER_URI", "kind": "env" }
   ]
 }
 ```
+Edges come from `depends_on` **and** from environment values that reference another service as a
+host (`svc:port`, `//svc`, `user:pw@svc`, or any key matching `HOST|URL|URI|UPSTREAM|BROKERS|SERVERS|ADDR|ENDPOINT`
+whose value names the service). Optional (profile-gated) nodes render with a dashed outline.
 
 #### 5. `systemArchitectureDiagram`
 High-level software component and system design diagram rendered via Mermaid:

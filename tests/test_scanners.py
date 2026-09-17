@@ -256,3 +256,83 @@ def test_sql_field_constants_and_entity_manager(build_html, tmp_path):
     assert set(by_fn) == {'ReportDao.TOTALS', 'ReportDao.open()'}
     assert by_fn['ReportDao.TOTALS']['tables'] == ['invoice']
     assert by_fn['ReportDao.open()']['queryType'] == 'jpql'
+
+
+# ---------------------------------------------------------------- docker-compose
+
+EXPECTED_SPRING_SERVICES = [
+    ('api', 'app', 8081), ('postgres', 'database', 5432), ('kafka', 'queue', 9092),
+    ('keycloak', 'auth', 8080), ('mailpit', 'mail', 8025), ('nginx', 'proxy', 80)]
+
+
+def test_docker_yaml_ports_profiles_depends_and_env_edges(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    infra, diagram = build_html._scan_docker(root)
+    assert [(s['id'], s['type'], s['port']) for s in infra] == EXPECTED_SPRING_SERVICES
+    by_id = {s['id']: s for s in infra}
+    assert by_id['mailpit']['optional'] is True and by_id['mailpit']['profiles'] == ['dev']
+    assert by_id['kafka']['ports'] == [9092, 9093]           # short + long port syntax
+    assert 'optional' not in by_id['api']
+
+    edges = {(e['from'], e['to']): e for e in diagram['edges']}
+    assert sorted(edges) == [('api', 'kafka'), ('api', 'keycloak'), ('api', 'mailpit'), ('api', 'postgres'),
+                             ('keycloak', 'postgres'), ('nginx', 'api'), ('nginx', 'keycloak')]
+    assert edges[('api', 'postgres')]['kind'] == 'depends_on'        # map-form depends_on
+    assert edges[('nginx', 'api')]['kind'] == 'depends_on'           # flow-list depends_on
+    assert edges[('api', 'keycloak')] == {'from': 'api', 'to': 'keycloak', 'label': 'KEYCLOAK_ISSUER_URI', 'kind': 'env'}
+    assert edges[('api', 'mailpit')]['label'] == 'MAIL_HOST'
+    optional_nodes = [n['id'] for n in diagram['nodes'] if n.get('optional')]
+    assert optional_nodes == ['mailpit']
+
+
+def test_docker_line_parser_fallback_without_pyyaml(build_html, fixture_project, monkeypatch):
+    monkeypatch.setattr(build_html, '_yaml', None)
+    root = fixture_project('spring-kts')
+    infra, diagram = build_html._scan_docker(root)
+    assert [(s['id'], s['type'], s['port']) for s in infra] == EXPECTED_SPRING_SERVICES
+    assert sorted((e['from'], e['to']) for e in diagram['edges']) == [
+        ('api', 'kafka'), ('api', 'postgres'), ('keycloak', 'postgres'), ('nginx', 'api'), ('nginx', 'keycloak')]
+    root = fixture_project('express')
+    infra, _ = build_html._scan_docker(root)
+    assert [(s['id'], s['port']) for s in infra] == [('api', 3000), ('postgres', 5432), ('redis', 6379)]
+
+
+def test_compose_port_forms(build_html):
+    p = build_html._compose_port
+    assert p(5432) == 5432
+    assert p('5432') == 5432
+    assert p('5432:5432') == 5432
+    assert p('127.0.0.1:8080:80') == 8080
+    assert p('[::1]:8443:443') == 8443
+    assert p('8080-8081:80-81') == 8080
+    assert p('9092:9092/udp') == 9092
+    assert p({'target': 9093, 'published': 19093}) == 19093
+    assert p({'target': 9093}) == 9093
+    assert p({'target': 80, 'published': '8000-8001'}) == 8000
+
+
+def test_infer_service_type_from_image(build_html):
+    t = build_html._infer_service_type
+    assert t('idp', 'quay.io/keycloak/keycloak:26.0') == 'auth'
+    assert t('broker', 'apache/kafka:3.9.0') == 'queue'
+    assert t('mail', 'axllent/mailpit') == 'mail'
+    assert t('edge', 'nginx:1.27') == 'proxy'
+    assert t('pbx', 'andrius/asterisk') == 'voice'
+    assert t('metrics', 'prom/prometheus') == 'monitoring'
+    assert t('topics', 'provectuslabs/kafka-ui') == 'monitoring'
+    assert t('db', '') == 'database'
+    assert t('worker', 'ghcr.io/acme/worker:1') == 'app'
+
+
+def test_docker_diagram_html_has_styles_for_new_types(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    data = build_html.init_architecture(root)
+    out_dir = os.path.join(root, 'docs', 'architecture')
+    build_html.generate_html(data, out_dir)
+    page = open(os.path.join(out_dir, 'architecture.html'), encoding='utf-8').read()
+    docker_src = page.split('id="dockerMermaidSrc">', 1)[1].split('</script>', 1)[0]
+    assert 'classDef auth' in docker_src and 'classDef mail' in docker_src
+    assert 'class keycloak auth;' in docker_src
+    assert 'class mailpit mail;' in docker_src
+    assert 'style mailpit stroke-dasharray' in docker_src
+    assert 'api -->|"KEYCLOAK_ISSUER_URI"| keycloak' in docker_src
