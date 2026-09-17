@@ -55,6 +55,8 @@ Ask the user (or infer from context) exactly what changed:
 **1. Copy Template Script (if not present):**
 Check if `docs/architecture/build_html.py` exists in the target project workspace.
 If missing, ensure directory `docs/architecture` exists and copy `build_html.py` from the `arch-wiki` skill templates directory into `docs/architecture/build_html.py`.
+If the project needs scanner corrections, also copy `templates/arch_overrides.example.py` to
+`docs/architecture/arch_overrides.py` (see the override hook below).
 
 **2. Run Script Execution:**
 
@@ -94,6 +96,27 @@ If missing, ensure directory `docs/architecture` exists and copy `build_html.py`
 > [!NOTE]
 > The codebase scanner automatically excludes build artifacts (`dist/`, `build/`, `node_modules/`)
 > to prevent duplicate route modules and sanitizes diagram nodes for error-free Mermaid rendering.
+
+**3. Project override hook (optional):**
+
+Many projects have a better source of truth than any generic scanner — a permission catalog
+file, a frontend API client that maps calls to pages, a hand-maintained list of which SQL
+queries serve which endpoints. If `docs/architecture/arch_overrides.py` exists, `--init` /
+`--sync` import it after all scanners have run and call:
+
+```python
+def apply(data: dict, root: str) -> dict | None
+```
+
+- `data` is the complete manifest (every section of `architecture.json`); `root` is the absolute
+  project root. Mutate `data` in place or return a new dict; returning `None` keeps `data`.
+- The returned manifest is written as-is. Only `swaggerSchemas.matchStatus` is recomputed, so if
+  the hook changes endpoint permissions it should rebuild the catalog with
+  `import build_html; data["permissions"] = build_html.build_permissions(data["modules"])`.
+- Exceptions abort the run (the traceback names the hook file), so a stale catalog fails loudly.
+- Start from `templates/arch_overrides.example.py` in the skill directory — it shows merging a
+  `permissions.json` catalog, attributing endpoints to frontend pages, and correcting service
+  descriptions. Copy it to `docs/architecture/arch_overrides.py` and edit.
 
 ---
 

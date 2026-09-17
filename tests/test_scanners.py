@@ -383,3 +383,72 @@ def test_permission_catalog_has_clean_slugs_and_public_count(build_html, fixture
     assert '<div class="stat-num">19</div><div class="stat-lbl">Authenticated Endpoints</div>' in page
     assert '<div class="stat-num">5</div><div class="stat-lbl">Object-Level Checks</div>' in page
     assert 'object-level' in page
+
+
+# ---------------------------------------------------------------- override hook
+
+def test_arch_overrides_hook_is_applied(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    arch_dir = os.path.join(root, 'docs', 'architecture')
+    os.makedirs(arch_dir, exist_ok=True)
+    with open(os.path.join(arch_dir, 'arch_overrides.py'), 'w') as f:
+        f.write('''
+import build_html
+def apply(data, root):
+    assert data["modules"] and "sqlQueries" in data
+    data["meta"]["techStack"]["auth"] = "Keycloak OIDC"
+    data["modules"] = [m for m in data["modules"] if m["id"] == "users"]
+    for ep in data["modules"][0]["endpoints"]:
+        ep["permission"] = "users.any"
+        ep["auth"] = True
+    data["permissions"] = build_html.build_permissions(data["modules"])
+    data["sqlQueries"][0]["endpoints"] = [{"method": "GET", "path": "/api/v1/users"}]
+    data["hookRoot"] = root
+    return data
+''')
+    data = build_html.init_architecture(root)
+    assert data['meta']['techStack']['auth'] == 'Keycloak OIDC'
+    assert [m['id'] for m in data['modules']] == ['users']
+    assert data['permissions']['catalog'] == ['users.any']
+    assert data['swaggerSchemas']['matchStatus'] == 'Verified Parity (5/5 Endpoints)'
+    assert data['sqlQueries'][0]['endpoints'] == [{'method': 'GET', 'path': '/api/v1/users'}]
+    assert data['hookRoot'] == root
+    written = json.load(open(os.path.join(arch_dir, 'architecture.json')))
+    assert written['permissions']['catalog'] == ['users.any']
+
+
+def test_arch_overrides_returning_none_keeps_data_and_errors_propagate(build_html, fixture_project):
+    import pytest
+    root = fixture_project('express')
+    arch_dir = os.path.join(root, 'docs', 'architecture')
+    os.makedirs(arch_dir, exist_ok=True)
+    hook = os.path.join(arch_dir, 'arch_overrides.py')
+    with open(hook, 'w') as f:
+        f.write('def apply(data, root):\n    data["meta"]["version"] = "9.9.9"\n')
+    assert build_html.init_architecture(root)['meta']['version'] == '9.9.9'
+    with open(hook, 'w') as f:
+        f.write('def apply(data, root):\n    raise ValueError("bad catalog")\n')
+    with pytest.raises(ValueError):
+        build_html.init_architecture(root)
+
+
+def test_example_override_hook_runs(build_html, fixture_project):
+    import importlib.util
+    root = fixture_project('spring-kts')
+    os.makedirs(os.path.join(root, 'docs'), exist_ok=True)
+    with open(os.path.join(root, 'docs', 'permissions.json'), 'w') as f:
+        json.dump([{'slug': 'billing.invoice.view', 'pages': ['Invoices', 'Customer Detail']}], f)
+    fe = os.path.join(root, 'frontend', 'src', 'pages', 'invoices')
+    os.makedirs(fe)
+    with open(os.path.join(fe, 'api.ts'), 'w') as f:
+        f.write("export const load = () => api.get('/api/v1/payments');\n")
+    spec = importlib.util.spec_from_file_location('arch_overrides_example',
+                                                  os.path.join(os.path.dirname(build_html.__file__), 'arch_overrides.example.py'))
+    example = importlib.util.module_from_spec(spec); spec.loader.exec_module(example)
+    data = example.apply(build_html.init_architecture(root), root)
+    idx = endpoint_index(data)
+    assert idx[('GET', '/api/v1/payments')]['pages'] == ['Invoices']
+    pay = next(d for d in data['permissions']['details'] if d['slug'] == 'billing.payment.view')
+    assert pay['adminPages'] == ['Invoices']
+    inv = next(d for d in data['permissions']['details'] if d['slug'] == 'billing.invoice.view')
+    assert inv['adminPages'] == ['Invoices', 'Customer Detail']

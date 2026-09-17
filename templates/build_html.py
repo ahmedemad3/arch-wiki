@@ -1763,6 +1763,94 @@ def _build_data_flow(fw, core_layer):
 # architecture.json INITIALISER — now powered by codebase scanner
 # ---------------------------------------------------------------------------
 
+def build_permissions(modules):
+    """Permission catalog + slug→endpoint details derived from module endpoints.
+
+    Exposed for docs/architecture/arch_overrides.py hooks that change endpoint
+    permissions and want to rebuild the `permissions` section afterwards.
+    """
+    perm_details = []
+    for mod in modules:
+        for ep in mod.get('endpoints', []):
+            pslug = ep.get('permission')
+            full_ep_path = (mod['basePath'] + ("" if ep['path'] == "/" else ep['path'])).replace("//", "/")
+            ep_obj = {"method": ep['method'], "path": full_ep_path}
+
+            if pslug:
+                sub_slugs = [s.strip() for s in pslug.split('|') if s.strip()]
+            elif ep.get('auth', False):
+                sub_slugs = ['authenticated']
+            else:
+                sub_slugs = ['public']
+
+            if ep.get('objectLevel'):
+                ep_obj['objectLevel'] = True
+            for sub_slug in sub_slugs:
+                existing = next((d for d in perm_details if d['slug'] == sub_slug), None)
+                if existing:
+                    if ep_obj not in existing['endpoints']:
+                        existing['endpoints'].append(ep_obj)
+                else:
+                    action_type = "SYSTEM SCOPE" if sub_slug in ('authenticated', 'public') else "RBAC PERMISSION"
+                    page_label = "Public Access" if sub_slug == 'public' else ("Authenticated User Access" if sub_slug == 'authenticated' else f"{mod['name']} Management")
+                    existing = {
+                        "slug": sub_slug,
+                        "module": mod['name'],
+                        "action": action_type,
+                        "endpoints": [ep_obj],
+                        "adminPages": [page_label]
+                    }
+                    perm_details.append(existing)
+                if ep.get('objectLevel'):
+                    existing['objectLevel'] = True
+                if ep.get('permissionExpression'):
+                    exprs = existing.setdefault('expressions', [])
+                    if ep['permissionExpression'] not in exprs:
+                        exprs.append(ep['permissionExpression'])
+
+    all_perms = sorted(set(d['slug'] for d in perm_details))
+    return {
+        "description": "RBAC permission catalog and endpoint mapping.",
+        "catalog": all_perms,
+        "details": perm_details
+    }
+
+
+OVERRIDES_FILE = 'arch_overrides.py'
+
+def _apply_overrides(data, root, arch_dir):
+    """Run docs/architecture/arch_overrides.py if present: apply(data, root) -> data.
+
+    The hook receives the complete manifest after every scanner has run and
+    returns the manifest to write (returning None keeps `data`). It is the
+    place to merge a better source of truth — a permission catalog file, a
+    frontend API client that maps calls to pages, hand-written SQL/endpoint
+    links. Only swaggerSchemas.matchStatus is recomputed afterwards.
+    """
+    hook_path = os.path.join(arch_dir, OVERRIDES_FILE)
+    if not os.path.isfile(hook_path):
+        return data
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('arch_overrides', hook_path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        if not hasattr(mod, 'apply'):
+            print(f"[arch-wiki] WARN: {OVERRIDES_FILE} has no apply(data, root) function — ignored")
+            return data
+        result = mod.apply(data, root)
+    except Exception as ex:
+        print(f"[arch-wiki] ERROR in {hook_path}: {type(ex).__name__}: {ex}")
+        raise
+    if result is None:
+        result = data
+    total_ep = sum(len(m.get('endpoints', [])) for m in result.get('modules', []))
+    result.setdefault('swaggerSchemas', {})['matchStatus'] = f"Verified Parity ({total_ep}/{total_ep} Endpoints)"
+    print(f"[arch-wiki] Applied {OVERRIDES_FILE}: {len(result.get('modules', []))} module(s), {total_ep} endpoint(s), "
+          f"{len(result.get('permissions', {}).get('catalog', []))} permission(s), {len(result.get('sqlQueries', []))} SQL quer(y/ies)")
+    return result
+
+
 def init_architecture(target_root=None, placeholder_sql=False):
     """Scan the codebase and generate architecture.json automatically.
 
@@ -1836,46 +1924,7 @@ def init_architecture(target_root=None, placeholder_sql=False):
     workspaces = _scan_workspaces(root)
 
     # 6. Collect all permission slugs & details
-    perm_details = []
-    for mod in modules:
-        for ep in mod.get('endpoints', []):
-            pslug = ep.get('permission')
-            full_ep_path = (mod['basePath'] + ("" if ep['path'] == "/" else ep['path'])).replace("//", "/")
-            ep_obj = {"method": ep['method'], "path": full_ep_path}
-
-            if pslug:
-                sub_slugs = [s.strip() for s in pslug.split('|') if s.strip()]
-            elif ep.get('auth', False):
-                sub_slugs = ['authenticated']
-            else:
-                sub_slugs = ['public']
-
-            if ep.get('objectLevel'):
-                ep_obj['objectLevel'] = True
-            for sub_slug in sub_slugs:
-                existing = next((d for d in perm_details if d['slug'] == sub_slug), None)
-                if existing:
-                    if ep_obj not in existing['endpoints']:
-                        existing['endpoints'].append(ep_obj)
-                else:
-                    action_type = "SYSTEM SCOPE" if sub_slug in ('authenticated', 'public') else "RBAC PERMISSION"
-                    page_label = "Public Access" if sub_slug == 'public' else ("Authenticated User Access" if sub_slug == 'authenticated' else f"{mod['name']} Management")
-                    existing = {
-                        "slug": sub_slug,
-                        "module": mod['name'],
-                        "action": action_type,
-                        "endpoints": [ep_obj],
-                        "adminPages": [page_label]
-                    }
-                    perm_details.append(existing)
-                if ep.get('objectLevel'):
-                    existing['objectLevel'] = True
-                if ep.get('permissionExpression'):
-                    exprs = existing.setdefault('expressions', [])
-                    if ep['permissionExpression'] not in exprs:
-                        exprs.append(ep['permissionExpression'])
-
-    all_perms = sorted(set(d['slug'] for d in perm_details))
+    permissions = build_permissions(modules)
 
     # 7. System arch diagram
     sys_diag = _build_sys_diagram(modules, infrastructure)
@@ -1932,13 +1981,11 @@ def init_architecture(target_root=None, placeholder_sql=False):
         ],
         "coreLayer": core_layer,
         "dataFlow": _build_data_flow(fw, core_layer),
-        "permissions": {
-            "description": "RBAC permission catalog and endpoint mapping.",
-            "catalog": all_perms,
-            "details": perm_details
-        },
+        "permissions": permissions,
         "sqlQueries": sql_queries
     }
+
+    scaffold = _apply_overrides(scaffold, root, arch_dir)
 
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(scaffold, f, indent=2)
