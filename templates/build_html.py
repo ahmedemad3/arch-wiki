@@ -91,7 +91,8 @@ def _find_root(start):
     Checks for markers like docker-compose.yml, package.json, backend/, .git, etc."""
     markers = [
         'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', '.git',
-        'package.json', 'requirements.txt', 'go.mod', 'Gemfile', 'pom.xml', 'Cargo.toml', 'composer.json'
+        'package.json', 'requirements.txt', 'go.mod', 'Gemfile', 'pom.xml', 'Cargo.toml', 'composer.json',
+        'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts'
     ]
     cur = os.path.abspath(start)
     for _ in range(5):
@@ -105,12 +106,78 @@ def _find_root(start):
         cur = parent
     return os.path.abspath(os.path.join(start, "..", ".."))  # default to 2 levels up from docs/architecture
 
-def _detect_fw(root):
+_JAVA_BUILD_FILES = ['pom.xml', 'build.gradle.kts', 'build.gradle', 'settings.gradle.kts', 'settings.gradle']
+
+def _java_build_file(root):
+    """Return the path of the first Maven/Gradle build file found at root or a common sub-dir, else None."""
     for sub in ['', 'app', 'server', 'backend', 'apps/api', 'apps/server', 'apps/backend']:
-        if os.path.isfile(os.path.join(root, sub, 'pom.xml')) or os.path.isfile(os.path.join(root, 'pom.xml')):
-            return 'spring'
-        if os.path.isfile(os.path.join(root, sub, 'build.gradle')) or os.path.isfile(os.path.join(root, 'build.gradle')):
-            return 'spring'
+        for bf in _JAVA_BUILD_FILES:
+            p = os.path.join(root, sub, bf) if sub else os.path.join(root, bf)
+            if os.path.isfile(p):
+                return p
+    return None
+
+def _read(path):
+    try:
+        return open(path, encoding='utf-8', errors='ignore').read()
+    except Exception:
+        return ''
+
+def _java_build_info(root):
+    """Derive build tool, Java and Spring Boot versions from pom.xml / build.gradle(.kts).
+
+    Returns a dict: {'buildTool': 'maven'|'gradle'|None, 'buildFile': rel path or None,
+    'kotlinDsl': bool, 'javaVersion': '25'|None, 'springBootVersion': '4.0.0'|None}.
+    """
+    info = {'buildTool': None, 'buildFile': None, 'kotlinDsl': False,
+            'javaVersion': None, 'springBootVersion': None}
+    bf = _java_build_file(root)
+    if not bf:
+        return info
+    bdir = os.path.dirname(bf)
+    is_maven = os.path.basename(bf) == 'pom.xml'
+    info['buildTool'] = 'maven' if is_maven else 'gradle'
+    # Prefer the build script over settings when both exist (versions live there)
+    if not is_maven:
+        for cand in ['build.gradle.kts', 'build.gradle']:
+            if os.path.isfile(os.path.join(bdir, cand)):
+                bf = os.path.join(bdir, cand); break
+    info['buildFile'] = os.path.relpath(bf, root).replace('\\', '/')
+    info['kotlinDsl'] = bf.endswith('.kts')
+    txt = _read(bf)
+
+    if is_maven:
+        jv = (re.search(r'<java\.version>\s*([\d.]+)\s*</java\.version>', txt)
+              or re.search(r'<maven\.compiler\.(?:release|source|target)>\s*([\d.]+)\s*<', txt)
+              or re.search(r'<release>\s*([\d.]+)\s*</release>', txt))
+        if jv: info['javaVersion'] = jv.group(1)
+        sb = re.search(r'<artifactId>spring-boot-starter-parent</artifactId>\s*<version>([^<]+)</version>', txt)
+        if not sb:
+            sb = re.search(r'<artifactId>spring-boot(?:-dependencies)?</artifactId>\s*<version>([^<]+)</version>', txt)
+        if not sb:
+            sb = re.search(r'<spring-boot\.version>([^<]+)</spring-boot\.version>', txt)
+        if sb: info['springBootVersion'] = sb.group(1).strip()
+    else:
+        jv = (re.search(r'JavaLanguageVersion\.of\(\s*(\d+)\s*\)', txt)
+              or re.search(r'(?:sourceCompatibility|targetCompatibility)\s*=\s*(?:JavaVersion\.VERSION_)?["\']?(\d+(?:_\d+)?)', txt)
+              or re.search(r'options\.release(?:\.set)?\s*[=(]\s*(\d+)', txt))
+        if jv: info['javaVersion'] = jv.group(1).replace('1_', '1.').replace('_', '.')
+        sb = re.search(r'["\']org\.springframework\.boot["\']\s*\)?\s*version\s*\(?\s*["\']([^"\']+)["\']', txt)
+        if not sb:
+            # Version catalog: gradle/libs.versions.toml → spring-boot = "4.0.0"
+            toml = _read(os.path.join(root, 'gradle', 'libs.versions.toml'))
+            sb = re.search(r'^\s*spring[-_.]?boot\s*=\s*["\']([^"\']+)["\']', toml, re.MULTILINE)
+        if sb: info['springBootVersion'] = sb.group(1).strip()
+    # Java version may live in the version catalog or gradle.properties too
+    if not info['javaVersion'] and not is_maven:
+        for extra in [os.path.join(root, 'gradle', 'libs.versions.toml'), os.path.join(root, 'gradle.properties')]:
+            m = re.search(r'^\s*(?:java|jdk)(?:[-_.]?version)?\s*=\s*["\']?(\d+)', _read(extra), re.MULTILINE)
+            if m: info['javaVersion'] = m.group(1); break
+    return info
+
+def _detect_fw(root):
+    if _java_build_file(root):
+        return 'spring'
     for sub in ['', 'backend', 'api', 'server', 'app', 'apps/api', 'apps/server', 'apps/backend']:
         pkg = os.path.join(root, sub, 'package.json') if sub else os.path.join(root, 'package.json')
         if os.path.isfile(pkg):
@@ -458,6 +525,19 @@ def _scan_fastapi(root):
             })
     return modules
 
+def _gradle_includes(root):
+    """Sub-project names from settings.gradle(.kts): include("a", ":b") / include 'a', 'b' / include(":a:b")."""
+    for name in ['settings.gradle.kts', 'settings.gradle']:
+        txt = _read(os.path.join(root, name))
+        if not txt: continue
+        mods = []
+        for m in re.finditer(r'^\s*include\s*\(?\s*((?:["\'][^"\']+["\']\s*,?\s*)+)\)?', txt, re.MULTILINE):
+            for q in re.findall(r'["\']([^"\']+)["\']', m.group(1)):
+                q = q.strip(':').replace(':', '/')
+                if q and q not in mods: mods.append(q)
+        return mods
+    return []
+
 def _detect_arch_type(root, fw):
     """
     Determines whether the codebase architecture is:
@@ -483,14 +563,9 @@ def _detect_arch_type(root, fw):
                 return 'modular_monolith'
         except: pass
 
-    # Check Gradle build.gradle / settings.gradle
-    settings_gradle = os.path.join(root, 'settings.gradle')
-    if os.path.isfile(settings_gradle):
-        try:
-            txt = open(settings_gradle, encoding='utf-8', errors='ignore').read()
-            if 'include ' in txt or 'include(' in txt:
-                return 'modular_monolith'
-        except: pass
+    # Check Gradle settings.gradle / settings.gradle.kts for sub-project includes
+    if _gradle_includes(root):
+        return 'modular_monolith'
 
     # Check top-level directories for multiple src/main/java sub-projects
     subdirs_with_src = 0
@@ -726,6 +801,21 @@ def _scan_workspaces(root):
                 'entrypoint': f"{sm_clean}/pom.xml"
             })
         if ws: return ws
+
+    gradle_mods = _gradle_includes(root)
+    if gradle_mods:
+        for gm in gradle_mods:
+            bf = next((c for c in ['build.gradle.kts', 'build.gradle']
+                       if os.path.isfile(os.path.join(root, gm, c))), 'build.gradle.kts')
+            ws.append({
+                'id': gm.replace('/', '-'),
+                'name': gm,
+                'type': 'backend',
+                'description': f"{os.path.basename(gm).replace('-',' ').replace('_',' ').title()} Module",
+                'port': None,
+                'entrypoint': f"{gm}/{bf}"
+            })
+        return ws
 
     for sub in ['backend','frontend','api','web','mobile','admin']:
         p = os.path.join(root, sub)
@@ -1068,6 +1158,13 @@ def init_architecture(target_root=None):
                'spring': {'language':'Java 17',   'framework':'Spring Boot'},
                'unknown':{'language':'TypeScript','framework':'Express.js'}}.get(fw,{'language':'TypeScript','framework':'Express.js'})
 
+    java_info = _java_build_info(root) if fw in ('spring', 'java') else {}
+    if java_info:
+        if java_info.get('javaVersion'):
+            fw_info = dict(fw_info, language=f"Java {java_info['javaVersion']}")
+        if java_info.get('springBootVersion'):
+            fw_info = dict(fw_info, framework=f"Spring Boot {java_info['springBootVersion']}")
+
     print(f"[arch-wiki] Root: {root} | Framework: {fw}")
 
     # 3. Scan docker-compose
@@ -1219,7 +1316,7 @@ def init_architecture(target_root=None):
     today = datetime.date.today().isoformat()
     total_ep_str = f"{total_ep}/{total_ep}"
 
-    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces)
+    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces, java_info)
 
     scaffold = {
         "meta": {
@@ -1271,8 +1368,9 @@ def init_architecture(target_root=None):
     return scaffold
 
 
-def _scan_prerequisites(root, fw, infrastructure, workspaces):
+def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
     tools = []
+    java_info = java_info or {}
 
     # 1. Primary Runtime Engine
     if fw in ('express', 'nestjs', 'fastify'):
@@ -1286,7 +1384,7 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
     elif fw in ('spring', 'java'):
         tools.append({
             "name": "Java OpenJDK / JDK",
-            "version": ">= 17",
+            "version": f">= {java_info.get('javaVersion') or '17'}",
             "required": True,
             "category": "runtime",
             "description": "Java SE Development Kit required for Spring Boot backend compilation and execution."

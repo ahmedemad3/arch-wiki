@@ -66,3 +66,53 @@ def test_generate_html_writes_page(build_html, fixture_project, tmp_path):
     assert '<title>' in html and 'Acme Express Api' in html
     json.loads(html.split('id="swaggerOpenApiJsonSrc">', 1)[1].split('</code>', 1)[0]
                .replace('&quot;', '"').replace('&#x27;', "'").replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&'))
+
+
+# ---------------------------------------------------------------- Spring / Gradle KTS
+
+def test_spring_kts_detection_and_versions(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    assert build_html._detect_fw(root) == 'spring'
+    assert build_html._detect_arch_type(root, 'spring') == 'microservice'  # docker-compose present
+    assert build_html._gradle_includes(root) == ['billing', 'users', 'messaging']
+
+    info = build_html._java_build_info(root)
+    assert info['buildTool'] == 'gradle' and info['kotlinDsl'] is True
+    assert info['buildFile'] == 'build.gradle.kts'
+    assert info['javaVersion'] == '25'
+    assert info['springBootVersion'] == '4.0.0'
+
+    data = build_html.init_architecture(root)
+    assert data['meta']['techStack'] == {
+        'language': 'Java 25', 'framework': 'Spring Boot 4.0.0',
+        'database': 'Postgres', 'auth': 'JWT / Bearer Token'}
+    jdk = next(t for t in data['prerequisites']['tools'] if t['category'] == 'runtime')
+    assert jdk['version'] == '>= 25'
+    assert [w['name'] for w in data['workspaces']] == ['billing', 'users', 'messaging']
+    assert data['workspaces'][0]['entrypoint'] == 'billing/build.gradle.kts'
+
+
+def test_java_build_info_maven_and_groovy(build_html, tmp_path):
+    mvn = tmp_path / 'mvn'; mvn.mkdir()
+    (mvn / 'pom.xml').write_text("""<project>
+      <parent><groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId><version>3.4.2</version></parent>
+      <properties><java.version>21</java.version></properties></project>""")
+    info = build_html._java_build_info(str(mvn))
+    assert (info['buildTool'], info['javaVersion'], info['springBootVersion']) == ('maven', '21', '3.4.2')
+
+    groovy = tmp_path / 'groovy'; groovy.mkdir()
+    (groovy / 'build.gradle').write_text("""plugins {
+        id 'org.springframework.boot' version '3.3.0'
+    }
+    sourceCompatibility = JavaVersion.VERSION_17
+    """)
+    info = build_html._java_build_info(str(groovy))
+    assert (info['buildTool'], info['kotlinDsl'], info['javaVersion'], info['springBootVersion']) == ('gradle', False, '17', '3.3.0')
+    assert build_html._detect_fw(str(groovy)) == 'spring'
+
+    catalog = tmp_path / 'catalog'; (catalog / 'gradle').mkdir(parents=True)
+    (catalog / 'build.gradle.kts').write_text('plugins { alias(libs.plugins.spring.boot) }\n')
+    (catalog / 'gradle' / 'libs.versions.toml').write_text('[versions]\nspring-boot = "3.5.1"\njava = "21"\n')
+    info = build_html._java_build_info(str(catalog))
+    assert (info['javaVersion'], info['springBootVersion']) == ('21', '3.5.1')

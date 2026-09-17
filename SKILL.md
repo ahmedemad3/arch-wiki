@@ -64,6 +64,13 @@ If missing, ensure directory `docs/architecture` exists and copy `build_html.py`
   ```
   *Scans project root metadata (`package.json`), Docker topology (`docker-compose.yml`), and API routes to create `architecture.json` and generate `architecture.html`.*
 
+  Framework detection looks for `pom.xml`, `build.gradle` **or `build.gradle.kts` / `settings.gradle.kts`**
+  (Spring Boot, Maven or Gradle incl. Kotlin DSL), then `package.json` (Express / NestJS / Fastify),
+  then Python manifests (FastAPI / Django / Flask). For Java projects the Java and Spring Boot
+  versions in `meta.techStack` are read from the build file (toolchain / `sourceCompatibility` /
+  `<java.version>`, Spring Boot plugin or parent version, `gradle/libs.versions.toml`), and Gradle
+  sub-projects from `settings.gradle(.kts)` become `workspaces`.
+
 - **Incremental Sync (After Adding Features / Endpoints / Queries):**
   ```bash
   python docs/architecture/build_html.py --sync
