@@ -1,0 +1,10 @@
+{
+  "name": "acme-express-api",
+  "version": "1.0.0",
+  "description": "Express fixture for arch-wiki scanner tests",
+  "dependencies": {
+    "express": "^4.19.0",
+    "jsonwebtoken": "^9.0.0",
+    "helmet": "^7.0.0"
+  }
+}
