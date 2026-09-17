@@ -219,11 +219,21 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
       "auth": true,
       "permission": "module:read or null",
       "description": "What this endpoint does",
-      "handler": "ControllerClass.methodName (optional, filled by the Spring scanner)"
+      "handler": "ControllerClass.methodName (optional, filled by the Spring scanner)",
+      "permissionExpression": "hasAuthority('module:read') and @acl.canRead(#id)  (optional, raw source expression)",
+      "objectLevel": true
     }
   ]
 }
 ```
+
+`permission` is always a plain slug (or `a | b` for alternatives). For Spring, `@PreAuthorize`
+SpEL is normalised — `hasAuthority('x')` → `x`, `hasAnyAuthority('a','b')` → `a | b`,
+`hasRole('ADMIN')` → `ROLE_ADMIN`, `isAuthenticated()` → `auth: true` with no slug,
+`permitAll()` → `auth: false` — and the raw expression is kept in `permissionExpression`.
+`objectLevel: true` marks endpoints whose check also depends on the target object
+(`@bean.method(...)`, `hasPermission(...)`, `#param` references). The "Public Endpoints" stat
+counts endpoints with `auth: false`; "Authenticated" counts `auth: true`.
 
 > [!NOTE]
 > **Spring:** the scanner parses every path of a mapping annotation (`@RequestMapping({"/a", "/b"})`,
@@ -247,13 +257,16 @@ Update `details` array with interactive flow connections:
       "module": "Users",
       "action": "UPDATE",
       "endpoints": [
-        { "method": "PUT", "path": "/api/v1/users/:id" }
+        { "method": "PUT", "path": "/api/v1/users/:id", "objectLevel": true }
       ],
-      "adminPages": ["User Management", "Edit User Form"]
+      "adminPages": ["User Management", "Edit User Form"],
+      "objectLevel": true,
+      "expressions": ["hasAuthority('users:write') and @acl.owns(#id)"]
     }
   ]
 }
 ```
+`objectLevel` and `expressions` are optional and filled by the Spring scanner.
 
 #### 9. `sqlQueries`
 Catalog mapping raw SQL statements or query builders to repository functions and endpoints:

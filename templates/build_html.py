@@ -1030,6 +1030,45 @@ def _get_perm(annos):
             if vals: return ' | '.join(vals)
     return None
 
+_SPEL_ROLE_CALLS = {'hasRole': 'ROLE_', 'hasAnyRole': 'ROLE_', 'hasAuthority': '', 'hasAnyAuthority': ''}
+
+def _normalize_spel(expr):
+    """Turn a Spring Security SpEL expression into catalog-friendly fields.
+
+    Returns {'permission': 'a.view | b.edit' or None, 'objectLevel': bool, 'auth': True/False/None}.
+      hasAuthority('x')              → x
+      hasAnyAuthority('a', 'b')      → a | b
+      hasRole('ADMIN')               → ROLE_ADMIN
+      isAuthenticated()              → permission None, auth True
+      permitAll() / isAnonymous()    → permission None, auth False
+      hasPermission(...), @bean.m(...), #param references → objectLevel True
+    An expression that is only an object-level bean call keeps `bean.method` as its slug.
+    """
+    res = {'permission': None, 'objectLevel': False, 'auth': None}
+    if not expr:
+        return res
+    slugs = []
+    for m in re.finditer(r'\b(hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\(([^)]*)\)', expr):
+        prefix = _SPEL_ROLE_CALLS[m.group(1)]
+        for lit in re.findall(r"['\"]([^'\"]+)['\"]", m.group(2)):
+            slug = lit if (not prefix or lit.startswith(prefix)) else prefix + lit
+            if slug not in slugs: slugs.append(slug)
+    bean_calls = re.findall(r'@(\w+)\.(\w+)\s*\(', expr)
+    object_level = bool(bean_calls) or bool(re.search(r'\bhasPermission\s*\(', expr)) or '#' in expr
+    if not slugs and bean_calls:
+        slugs = [f"{b}.{mth}" for b, mth in bean_calls]
+    if not slugs and re.search(r'\bhasPermission\s*\(', expr):
+        slugs = ['hasPermission']
+    if re.search(r'\bdenyAll\s*\(', expr):
+        slugs = ['denied'] + slugs
+    res['permission'] = ' | '.join(slugs) if slugs else None
+    res['objectLevel'] = object_level
+    if slugs or re.search(r'\bis(?:Fully)?Authenticated\s*\(|\bhasPermission\s*\(', expr):
+        res['auth'] = True
+    elif re.search(r'\b(?:permitAll|isAnonymous)\s*\(', expr):
+        res['auth'] = False
+    return res
+
 def _get_summary(annos):
     for a in annos:
         if a['name'] == 'Operation':
@@ -1128,14 +1167,19 @@ def _scan_java_spring(root, arch_type=None):
                             key_ep = f"{method}:{full}"
                             if key_ep in seen: continue
                             seen.add(key_ep)
-                            eps.append({
+                            norm = _normalize_spel(perm)
+                            ep = {
                                 'method': method,
                                 'path': full,          # re-relativised against the module basePath below
-                                'auth': file_auth or perm is not None,
-                                'permission': perm,
+                                'auth': (norm['auth'] if norm['auth'] is not None else file_auth),
+                                'permission': norm['permission'],
                                 'description': summary or _infer_desc(method, sub or '/', name),
                                 'handler': f"{class_name or raw_name}.{handler}" if handler else None,
-                            })
+                            }
+                            if perm:
+                                ep['permissionExpression'] = perm
+                                ep['objectLevel'] = norm['objectLevel']
+                            eps.append(ep)
 
         # Find matching screens/templates for this module
         mod_screens = []
@@ -1806,6 +1850,8 @@ def init_architecture(target_root=None, placeholder_sql=False):
             else:
                 sub_slugs = ['public']
 
+            if ep.get('objectLevel'):
+                ep_obj['objectLevel'] = True
             for sub_slug in sub_slugs:
                 existing = next((d for d in perm_details if d['slug'] == sub_slug), None)
                 if existing:
@@ -1814,13 +1860,20 @@ def init_architecture(target_root=None, placeholder_sql=False):
                 else:
                     action_type = "SYSTEM SCOPE" if sub_slug in ('authenticated', 'public') else "RBAC PERMISSION"
                     page_label = "Public Access" if sub_slug == 'public' else ("Authenticated User Access" if sub_slug == 'authenticated' else f"{mod['name']} Management")
-                    perm_details.append({
+                    existing = {
                         "slug": sub_slug,
                         "module": mod['name'],
                         "action": action_type,
                         "endpoints": [ep_obj],
                         "adminPages": [page_label]
-                    })
+                    }
+                    perm_details.append(existing)
+                if ep.get('objectLevel'):
+                    existing['objectLevel'] = True
+                if ep.get('permissionExpression'):
+                    exprs = existing.setdefault('expressions', [])
+                    if ep['permissionExpression'] not in exprs:
+                        exprs.append(ep['permissionExpression'])
 
     all_perms = sorted(set(d['slug'] for d in perm_details))
 
@@ -2305,6 +2358,10 @@ def generate_html(data, target_dir=None):
 
     tech_stack = meta.get('techStack', {})
     total_endpoints = sum(len(m.get('endpoints', [])) for m in modules) + len(system_endpoints)
+    _all_eps = [ep for m in modules for ep in m.get('endpoints', [])] + list(system_endpoints)
+    public_ep_count = sum(1 for ep in _all_eps if not ep.get('auth', False))
+    auth_ep_count = sum(1 for ep in _all_eps if ep.get('auth', False))
+    object_level_count = sum(1 for ep in _all_eps if ep.get('objectLevel'))
     prereq_tools = prerequisites.get('tools', [])
     prereq_steps = prerequisites.get('setupSteps', [])
 
@@ -3622,7 +3679,9 @@ def generate_html(data, target_dir=None):
                 else:
                     full_path = raw_p if raw_p else '/'
 
-            perm_str = f'<span class="lock">🔒 {html.escape(ep["permission"])}</span>' if ep.get('permission') else ('<span class="lock">🔑</span>' if ep.get('auth') else '')
+            perm_str = f'<span class="lock" title="{html.escape(ep.get("permissionExpression") or "")}">🔒 {html.escape(ep["permission"])}</span>' if ep.get('permission') else ('<span class="lock">🔑</span>' if ep.get('auth') else '')
+            if ep.get('objectLevel'):
+                perm_str += f'<span class="lock" title="{html.escape(ep.get("permissionExpression") or "Object-level authorization check")}">🔎 object-level</span>'
             eps_html += f"""
                 <div class="endpoint clickable-ep" data-method="{m}" data-path="{html.escape(full_path)}" onclick="openApiPromptFromEl(this)" title="Click to view AI Senior Developer prompt">
                     <span class="method {m}">{m}</span>
@@ -3885,9 +3944,9 @@ flowchart TD
                         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                             <span class="tag {m_class}" style="font-weight: 700; font-size: 11px;">{m}</span>
                             <span style="font-family: var(--font-code); font-weight: 600; font-size: 13px; color: var(--text);">{html.escape(full_path)}</span>
-                            {f'<span class="tag tb" style="font-size:10px; margin-left:auto;">&#128273; {html.escape(perm)}</span>' if perm else (
+                            {f'<span class="tag tb" style="font-size:10px; margin-left:auto;" title="{html.escape(ep.get("permissionExpression") or "")}">&#128273; {html.escape(perm)}</span>' if perm else (
                              '<span class="tag tg" style="font-size:10px; margin-left:auto;">&#128274; Authenticated</span>' if auth else '<span class="tag ty" style="font-size:10px; margin-left:auto;">&#127760; Public</span>'
-                            )}
+                            )}{f'<span class="tag tp" style="font-size:10px;" title="{html.escape(ep.get("permissionExpression") or "")}">&#128270; object-level</span>' if ep.get('objectLevel') else ''}
                         </div>
                         <div style="font-size: 12px; color: var(--muted); margin-top: 6px;">{html.escape(desc)}</div>
                         <div style="margin-top: 8px;">
@@ -3925,8 +3984,9 @@ flowchart TD
 
         <div class="stats" style="margin-bottom: 20px;">
             <div class="stat"><div class="stat-num">{len(permissions.get('catalog', []))}</div><div class="stat-lbl">Security Scopes / Slugs</div></div>
-            <div class="stat"><div class="stat-num">{sum(len(d.get('endpoints', [])) for d in permissions.get('details', []) if d.get('slug') != 'public')}</div><div class="stat-lbl">Authenticated Endpoints</div></div>
-            <div class="stat"><div class="stat-num">{sum(len(d.get('endpoints', [])) for d in permissions.get('details', []) if d.get('slug') == 'public')}</div><div class="stat-lbl">Public Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{auth_ep_count}</div><div class="stat-lbl">Authenticated Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{public_ep_count}</div><div class="stat-lbl">Public Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{object_level_count}</div><div class="stat-lbl">Object-Level Checks</div></div>
             <div class="stat"><div class="stat-num">{len(permissions.get('details', []))}</div><div class="stat-lbl">Mapped Scope Groups</div></div>
         </div>
 """
@@ -3959,6 +4019,11 @@ flowchart TD
                 eps_html += f'<span class="method {m}">{m}</span> <code style="font-size:12px">{html.escape(ep.get("path",""))}</code> &nbsp; '
 
             pages_html = ", ".join([f'<span class="tag tb">{html.escape(pg)}</span>' for pg in pdet.get('adminPages', [])])
+            if pdet.get('objectLevel'):
+                pages_html += ' <span class="tag tp" title="Some endpoints add an object-level check">&#128270; object-level</span>'
+            exprs_html = ""
+            if pdet.get('expressions'):
+                exprs_html = "".join(f'<div style="font-family:var(--font-code); font-size:11px; color:var(--muted); margin-top:4px;">{html.escape(x)}</div>' for x in pdet['expressions'])
             slug_val = pdet.get('slug', '')
             slug_icon = '🔑' if slug_val not in ('authenticated', 'public') else ('🔒' if slug_val == 'authenticated' else '🌐')
 
@@ -3974,6 +4039,7 @@ flowchart TD
                 <div style="margin-top: 6px; font-size: 12px; color: var(--muted);">
                     <strong>Scope Target:</strong> {pages_html}
                 </div>
+                {f'<div style="margin-top: 6px; font-size: 12px; color: var(--muted);"><strong>Raw expressions:</strong>{exprs_html}</div>' if exprs_html else ''}
             </div>
 """
         html_content += """

@@ -145,17 +145,21 @@ def test_spring_routes_multi_path_and_permissions(build_html, fixture_project):
     # path= after produces=, @PreAuthorize before the mapping, @Operation summary
     ep = idx[('GET', '/api/v1/invoices/customer/{customerId}')]
     assert ep['description'] == 'List invoices for a customer'
-    assert ep['permission'] == "hasAuthority('billing.invoice.view')"
+    assert ep['permission'] == 'billing.invoice.view'
+    assert ep['permissionExpression'] == "hasAuthority('billing.invoice.view')"
+    assert ep['objectLevel'] is False
     assert ep['handler'] == 'InvoiceController.byCustomer'
     # value={…} array, @PreAuthorize AFTER the mapping, @Operation after that
     ep = idx[('GET', '/api/v2/invoices/by-id/{id}')]
     assert ep['description'] == 'Get one invoice'
-    assert ep['permission'].startswith("hasAuthority('billing.invoice.view') and @billingAuth")
+    assert ep['permission'] == 'billing.invoice.view'
+    assert ep['objectLevel'] is True
+    assert ep['permissionExpression'].startswith("hasAuthority('billing.invoice.view') and @billingAuth")
     # @RequestMapping with method={POST, PUT} and produces=
     assert idx[('PUT', '/api/v1/invoices/{id}/void')]['permission'] is None
     # class-level @PreAuthorize applies to un-annotated methods, method-level overrides
-    assert idx[('GET', '/api/v1/payments/{id}')]['permission'] == "hasAuthority('billing.payment.view')"
-    assert idx[('POST', '/api/v1/payments/{id}/refund')]['permission'] == "hasRole('FINANCE')"
+    assert idx[('GET', '/api/v1/payments/{id}')]['permission'] == 'billing.payment.view'
+    assert idx[('POST', '/api/v1/payments/{id}/refund')]['permission'] == 'ROLE_FINANCE'
     # class @RequestMapping(path=…, produces=…)
     assert idx[('GET', '/api/v1/users/me')]['permission'] is None
     assert idx[('GET', '/api/public/ping')]['auth'] is False
@@ -336,3 +340,46 @@ def test_docker_diagram_html_has_styles_for_new_types(build_html, fixture_projec
     assert 'class mailpit mail;' in docker_src
     assert 'style mailpit stroke-dasharray' in docker_src
     assert 'api -->|"KEYCLOAK_ISSUER_URI"| keycloak' in docker_src
+
+
+# ---------------------------------------------------------------- permissions
+
+def test_normalize_spel(build_html):
+    n = build_html._normalize_spel
+    assert n("hasAuthority('x.view') and @auth.canAccess(authentication, #id)") == {
+        'permission': 'x.view', 'objectLevel': True, 'auth': True}
+    assert n("hasAnyAuthority('a', 'b')")['permission'] == 'a | b'
+    assert n("hasRole('ADMIN')")['permission'] == 'ROLE_ADMIN'
+    assert n("hasAnyRole('ROLE_A', 'B')")['permission'] == 'ROLE_A | ROLE_B'
+    assert n('isAuthenticated()') == {'permission': None, 'objectLevel': False, 'auth': True}
+    assert n('permitAll()') == {'permission': None, 'objectLevel': False, 'auth': False}
+    assert n('@userAuth.isSelfOrAdmin(#id)') == {'permission': 'userAuth.isSelfOrAdmin', 'objectLevel': True, 'auth': True}
+    assert n("hasPermission(#id, 'Invoice', 'read')")['objectLevel'] is True
+    assert n(None) == {'permission': None, 'objectLevel': False, 'auth': None}
+
+
+def test_permission_catalog_has_clean_slugs_and_public_count(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    data = build_html.init_architecture(root)
+    assert data['permissions']['catalog'] == [
+        'ROLE_ADMIN', 'ROLE_FINANCE', 'authenticated', 'billing.admin', 'billing.invoice.create',
+        'billing.invoice.view', 'billing.payment.view', 'public', 'userAuth.isSelfOrAdmin']
+    assert not any('(' in slug for slug in data['permissions']['catalog'])
+    view = next(d for d in data['permissions']['details'] if d['slug'] == 'billing.invoice.view')
+    assert view['objectLevel'] is True
+    assert sorted(view['expressions']) == [
+        "hasAuthority('billing.invoice.view')",
+        "hasAuthority('billing.invoice.view') and @billingAuth.canAccess(authentication, #id)"]
+    assert sum(1 for e in view['endpoints'] if e.get('objectLevel')) == 4
+    idx = endpoint_index(data)
+    assert idx[('GET', '/api/v1/users')]['auth'] is True          # isAuthenticated()
+    assert idx[('GET', '/api/v1/users')]['permission'] is None
+
+    out_dir = os.path.join(root, 'docs', 'architecture')
+    build_html.generate_html(data, out_dir)
+    page = open(os.path.join(out_dir, 'architecture.html'), encoding='utf-8').read()
+    # 1 public route (/api/public/ping) + the synthetic /health system endpoint
+    assert '<div class="stat-num">2</div><div class="stat-lbl">Public Endpoints</div>' in page
+    assert '<div class="stat-num">19</div><div class="stat-lbl">Authenticated Endpoints</div>' in page
+    assert '<div class="stat-num">5</div><div class="stat-lbl">Object-Level Checks</div>' in page
+    assert 'object-level' in page
