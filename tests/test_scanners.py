@@ -552,3 +552,15 @@ def test_messaging_producer_via_template_field(build_html, tmp_path):
         ('rabbitmq', 'notify.exchange/email', None, 'Bus.notify()'),
         ('kafka', None, True, 'Bus.raw()')]
     assert prods[2]['expression'] == 'topic'
+
+
+def test_meta_version_from_build_files(build_html, fixture_project, tmp_path):
+    root = fixture_project('spring-kts')
+    assert build_html.init_architecture(root)['meta']['version'] == '0.1.0'                          # build.gradle.kts
+    assert build_html.init_architecture(fixture_project('express'))['meta']['version'] == '1.0.0'      # package.json
+    (tmp_path / 'spring-kts' / 'VERSION').write_text('v2.3.4\n')
+    assert build_html.init_architecture(root)['meta']['version'] == '2.3.4'                          # VERSION wins
+    mvn = tmp_path / 'mvn'; mvn.mkdir()
+    (mvn / 'pom.xml').write_text('<project><parent><artifactId>spring-boot-starter-parent</artifactId><version>3.4.2</version></parent>'
+                                 '<artifactId>x</artifactId><version>7.0.0-SNAPSHOT</version></project>')
+    assert build_html._project_version(str(mvn), 'spring') == '7.0.0-SNAPSHOT'

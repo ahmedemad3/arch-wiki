@@ -1974,6 +1974,31 @@ def _apply_overrides(data, root, arch_dir):
     return result
 
 
+def _project_version(root, fw):
+    """Project version: VERSION file, then the build file (Gradle `version = "x"`, POM <version>,
+    pyproject/setup version). package.json is handled by the caller."""
+    for name in ('VERSION', 'VERSION.txt', 'version.txt'):
+        v = _read(os.path.join(root, name)).strip().splitlines()
+        if v and re.match(r'^v?\d[\w.\-+]*$', v[0].strip()):
+            return v[0].strip().lstrip('v')
+    if fw in ('spring', 'java'):
+        bf = _java_build_file(root)
+        if bf and os.path.basename(bf) == 'pom.xml':
+            txt = _read(bf)
+            body = re.sub(r'<parent>.*?</parent>', '', txt, flags=re.DOTALL)
+            m = re.search(r'<version>\s*([^<\s]+)\s*</version>', body)
+            if m: return m.group(1)
+        elif bf:
+            bdir = os.path.dirname(bf)
+            for cand in ('build.gradle.kts', 'build.gradle', 'gradle.properties'):
+                m = re.search(r'^\s*version\s*=\s*["\']?([^"\'\s]+)', _read(os.path.join(bdir, cand)), re.MULTILINE)
+                if m and m.group(1) not in ('unspecified',): return m.group(1)
+    elif fw in ('fastapi', 'django', 'flask'):
+        m = re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', _read(os.path.join(root, 'pyproject.toml')), re.MULTILINE)
+        if m: return m.group(1)
+    return None
+
+
 def init_architecture(target_root=None, placeholder_sql=False):
     """Scan the codebase and generate architecture.json automatically.
 
@@ -1993,14 +2018,17 @@ def init_architecture(target_root=None, placeholder_sql=False):
 
     proj_name = None
     proj_desc = None
+    proj_version = None
     for pkg_loc in [os.path.join(root, 'package.json'), os.path.join(root, 'backend', 'package.json')]:
         if os.path.isfile(pkg_loc):
             try:
                 d = json.load(open(pkg_loc, encoding='utf-8'))
                 if d.get('name'): proj_name = d.get('name')
                 if d.get('description'): proj_desc = d.get('description')
+                if d.get('version') and not proj_version: proj_version = str(d['version'])
                 if proj_name and proj_desc: break
             except: pass
+    proj_version = _project_version(root, fw) or proj_version or '1.0.0'
     if not proj_name or proj_name in ('arch-wiki', 'template'):
         proj_name = os.path.basename(root)
     if not proj_desc:
@@ -2089,7 +2117,7 @@ def init_architecture(target_root=None, placeholder_sql=False):
     scaffold = {
         "meta": {
             "displayName": display_name,
-            "version": "1.0.0",
+            "version": proj_version,
             "description": proj_desc or f"{display_name} REST API",
             "generatedAt": today,
             "techStack": {
