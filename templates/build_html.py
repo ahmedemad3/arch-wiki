@@ -1551,6 +1551,62 @@ def _scan_messaging_java(root):
                 producers.append(entry)
     return {'listeners': listeners, 'producers': producers}
 
+def _js_package_type(pkg, rel):
+    deps = {}
+    for k in ('dependencies', 'devDependencies', 'peerDependencies'):
+        deps.update(pkg.get(k) or {})
+    name = (pkg.get('name') or rel).lower()
+    if any(d in deps for d in ('react-native', 'expo', '@capacitor/core', '@ionic/core')): return 'mobile'
+    if any(d in deps for d in ('express', '@nestjs/core', 'fastify', 'koa', 'hapi', '@hapi/hapi')): return 'backend'
+    if any(d in deps for d in ('react', 'react-dom', 'vue', '@angular/core', 'svelte', 'next', 'nuxt', 'vite', '@remix-run/react', 'solid-js')): return 'frontend'
+    if any(k in name or k in rel.lower() for k in ('web', 'admin', 'ui', 'frontend', 'console', 'portal', 'dashboard')): return 'frontend'
+    if any(k in name or k in rel.lower() for k in ('mobile', 'ios', 'android')): return 'mobile'
+    if any(k in name or k in rel.lower() for k in ('api', 'server', 'backend', 'service')): return 'backend'
+    return 'package'
+
+def _scan_js_packages(root):
+    """Sub-packages with their own package.json: workspaces globs, pnpm-workspace.yaml, and a
+    depth-2 scan (frontend/admin/package.json, mobile-sdk/ios/package.json …)."""
+    globs = []
+    root_pkg = {}
+    try:
+        root_pkg = json.load(open(os.path.join(root, 'package.json'), encoding='utf-8'))
+    except Exception:
+        pass
+    wsp = root_pkg.get('workspaces')
+    if isinstance(wsp, dict): wsp = wsp.get('packages')
+    if isinstance(wsp, list): globs += [str(g) for g in wsp]
+    pnpm = _read(os.path.join(root, 'pnpm-workspace.yaml'))
+    globs += re.findall(r'^\s*-\s*["\']?([^"\'#\n]+?)["\']?\s*$', pnpm, re.MULTILINE)
+    globs += ['*', '*/*']
+    found = {}
+    for g in globs:
+        for pkg_path in _glob.glob(os.path.join(root, g.rstrip('/'), 'package.json')):
+            rel = os.path.relpath(os.path.dirname(pkg_path), root).replace('\\', '/')
+            if rel in ('.', '') or '/node_modules' in '/' + rel or rel.startswith(('.', 'node_modules', 'dist', 'build', 'docs')):
+                continue
+            if rel in found: continue
+            try:
+                pkg = json.load(open(pkg_path, encoding='utf-8'))
+            except Exception:
+                pkg = {}
+            port = None
+            pm = re.search(r'^PORT\s*=\s*(\d+)', _read(os.path.join(root, rel, '.env')), re.MULTILINE)
+            if pm: port = int(pm.group(1))
+            entry = next((f"{rel}/{c}" for c in ('src/index.ts', 'src/main.ts', 'src/index.js', 'src/main.tsx', 'src/main.js', 'index.ts', 'index.js')
+                          if os.path.isfile(os.path.join(root, rel, c))), f"{rel}/package.json")
+            t = _js_package_type(pkg, rel)
+            found[rel] = {
+                'id': rel.replace('/', '-'),
+                'name': pkg.get('name') or rel,
+                'type': t,
+                'description': (pkg.get('description') or f"{os.path.basename(rel).replace('-', ' ').replace('_', ' ').title()} "
+                                + {'backend': 'REST API', 'frontend': 'UI', 'mobile': 'mobile app', 'package': 'package'}[t]),
+                'port': port,
+                'entrypoint': entry
+            }
+    return list(found.values())
+
 def _scan_workspaces(root):
     ws = []
     pom_path = os.path.join(root, 'pom.xml')
@@ -1568,11 +1624,9 @@ def _scan_workspaces(root):
                 'port': port_base + idx,
                 'entrypoint': f"{sm_clean}/pom.xml"
             })
-        if ws: return ws
 
-    gradle_mods = _gradle_includes(root)
-    if gradle_mods:
-        for gm in gradle_mods:
+    if not ws:
+        for gm in _gradle_includes(root):
             bf = next((c for c in ['build.gradle.kts', 'build.gradle']
                        if os.path.isfile(os.path.join(root, gm, c))), 'build.gradle.kts')
             ws.append({
@@ -1583,11 +1637,18 @@ def _scan_workspaces(root):
                 'port': None,
                 'entrypoint': f"{gm}/{bf}"
             })
-        return ws
+
+    # JS/TS packages (frontends, SDKs, admin consoles) live alongside Java modules in many repos
+    js_pkgs = _scan_js_packages(root)
+    known = {w['id'] for w in ws}
+    for pkg in js_pkgs:
+        if pkg['id'] not in known:
+            ws.append(pkg); known.add(pkg['id'])
 
     for sub in ['backend','frontend','api','web','mobile','admin']:
         p = os.path.join(root, sub)
-        if not os.path.isdir(p): continue
+        if not os.path.isdir(p) or sub in known: continue
+        if any(w['entrypoint'].startswith(sub + '/') for w in ws): continue   # its sub-packages were found
         t = 'backend' if sub in ('backend','api') else 'frontend'
         port = 3000 if t == 'backend' else 80
         env = os.path.join(p, '.env')

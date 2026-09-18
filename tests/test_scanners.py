@@ -580,3 +580,33 @@ def test_migration_step_only_invents_task_with_plugin(build_html, tmp_path):
     liqui = steps(('c', 'dependencies { implementation("org.liquibase:liquibase-core") }'))
     assert 'liquibase' in liqui.lower() or liqui.startswith('#')
     assert 'update' not in liqui.split('#')[0]
+
+
+def test_workspaces_discover_nested_js_packages_next_to_gradle_modules(build_html, fixture_project):
+    root = fixture_project('spring-kts')
+    for rel, pkg in {
+        'frontend/admin': {'name': '@acme/admin', 'dependencies': {'react': '19'}},
+        'frontend/portal': {'name': '@acme/portal', 'dependencies': {'vue': '3'}, 'description': 'Customer portal'},
+        'mobile-sdk/ios': {'name': '@acme/sdk-ios', 'dependencies': {'react-native': '0.76'}},
+        'tools/cli': {'name': '@acme/cli'},
+    }.items():
+        os.makedirs(os.path.join(root, rel, 'src'), exist_ok=True)
+        json.dump(pkg, open(os.path.join(root, rel, 'package.json'), 'w'))
+    open(os.path.join(root, 'frontend', 'admin', 'src', 'main.tsx'), 'w').close()
+    open(os.path.join(root, 'frontend', 'admin', '.env'), 'w').write('PORT=5173\n')
+    os.makedirs(os.path.join(root, 'frontend', 'admin', 'node_modules', 'left-pad'))
+    json.dump({'name': 'left-pad'}, open(os.path.join(root, 'frontend', 'admin', 'node_modules', 'left-pad', 'package.json'), 'w'))
+
+    ws = {w['id']: w for w in build_html._scan_workspaces(root)}
+    assert sorted(ws) == ['billing', 'frontend-admin', 'frontend-portal', 'messaging', 'mobile-sdk-ios', 'tools-cli', 'users']
+    assert ws['frontend-admin'] == {'id': 'frontend-admin', 'name': '@acme/admin', 'type': 'frontend',
+                                    'description': 'Admin UI', 'port': 5173, 'entrypoint': 'frontend/admin/src/main.tsx'}
+    assert ws['frontend-portal']['description'] == 'Customer portal'
+    assert ws['mobile-sdk-ios']['type'] == 'mobile'
+    assert ws['tools-cli']['type'] == 'package'
+    assert 'frontend' not in ws                                   # parent dir not reported as a fake port-80 UI
+
+
+def test_workspaces_express_fixture_unchanged(build_html, fixture_project):
+    assert build_html._scan_workspaces(fixture_project('express')) == [
+        {'id': 'api', 'name': 'api', 'type': 'backend', 'description': 'Main REST API', 'port': 3000, 'entrypoint': 'src/index.ts'}]
