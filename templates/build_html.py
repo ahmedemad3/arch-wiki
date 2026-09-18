@@ -186,6 +186,9 @@ def _java_build_info(root):
     elif 'springfox' in dep_txt: info['apiDocs'] = 'springfox'
     if 'flyway' in dep_txt: info['migrations'] = 'flyway'
     elif 'liquibase' in dep_txt: info['migrations'] = 'liquibase'
+    # A CLI task only exists when the build *plugin* is declared; otherwise migrations run at boot
+    info['migrationPlugin'] = bool(re.search(
+        r'org\.flywaydb\.flyway|flyway-maven-plugin|org\.liquibase\.gradle|liquibase-maven-plugin|liquibase\.plugin', dep_txt))
 
     # server.port / context-path from the first application.{yml,yaml,properties} outside tests
     for r, dirs, fls in os.walk(root):
@@ -2412,12 +2415,16 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
     # Step 4: Database Migrations & Seeds
     if fw in ('spring', 'java'):
         mig = java_info.get('migrations')
-        if mig == 'flyway':
+        plugin = java_info.get('migrationPlugin')
+        if mig == 'flyway' and plugin:
             mig_cmd = "./gradlew flywayMigrate" if gradle else "./mvnw flyway:migrate"
-            mig_desc = "Apply Flyway migrations (they also run automatically at application start)."
-        elif mig == 'liquibase':
+            mig_desc = "Apply Flyway migrations via the build plugin (they also run at application start)."
+        elif mig == 'liquibase' and plugin:
             mig_cmd = "./gradlew update" if gradle else "./mvnw liquibase:update"
-            mig_desc = "Apply Liquibase changelogs (they also run automatically at application start)."
+            mig_desc = "Apply Liquibase changelogs via the build plugin (they also run at application start)."
+        elif mig:
+            mig_cmd = "# migrations run automatically at application start"
+            mig_desc = f"{mig.title()} is on the classpath without a build plugin — migrations apply when the app boots."
         else:
             mig_cmd = "# no Flyway/Liquibase detected — schema managed by JPA (spring.jpa.hibernate.ddl-auto)"
             mig_desc = "No migration tool detected — schema is managed by JPA/Hibernate at application start."

@@ -564,3 +564,19 @@ def test_meta_version_from_build_files(build_html, fixture_project, tmp_path):
     (mvn / 'pom.xml').write_text('<project><parent><artifactId>spring-boot-starter-parent</artifactId><version>3.4.2</version></parent>'
                                  '<artifactId>x</artifactId><version>7.0.0-SNAPSHOT</version></project>')
     assert build_html._project_version(str(mvn), 'spring') == '7.0.0-SNAPSHOT'
+
+
+def test_migration_step_only_invents_task_with_plugin(build_html, tmp_path):
+    def steps(build):
+        d = tmp_path / build[0]; d.mkdir()
+        (d / 'build.gradle.kts').write_text(build[1])
+        info = build_html._java_build_info(str(d))
+        pre = build_html._scan_prerequisites(str(d), 'spring', [], [], info)
+        return next(s['command'] for s in pre['setupSteps'] if s['title'].startswith('Run Schema'))
+    boot_only = steps(('a', 'dependencies { implementation("org.flywaydb:flyway-core") }'))
+    assert boot_only.startswith('#') and 'flywayMigrate' not in boot_only
+    with_plugin = steps(('b', 'plugins { id("org.flywaydb.flyway") version "10.0.0" }\ndependencies { implementation("org.flywaydb:flyway-core") }'))
+    assert with_plugin == './gradlew flywayMigrate'
+    liqui = steps(('c', 'dependencies { implementation("org.liquibase:liquibase-core") }'))
+    assert 'liquibase' in liqui.lower() or liqui.startswith('#')
+    assert 'update' not in liqui.split('#')[0]
