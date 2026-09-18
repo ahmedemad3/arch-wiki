@@ -432,20 +432,23 @@ def _parse_compose_lines(lines):
 _ENV_LINK_KEY_RE = re.compile(r'HOST|URL|URI|UPSTREAM|BROKERS?|SERVERS?|ADDR|ENDPOINT', re.IGNORECASE)
 
 def _env_links(svc_name, env, all_names):
-    """(target, env_key) pairs for env values that point at another compose service by hostname."""
+    """(target, env_key, port) triples for env values that point at another compose service by hostname.
+    port is the number following 'svc:' in the value, or None."""
     links = []
     for key, val in (env or {}).items():
         if not val: continue
         for other in all_names:
             if other == svc_name: continue
             tok = re.escape(other)
-            host_ref = (re.search(rf'(?<![\w.-]){tok}:\d+', val)                   # svc:port
-                        or re.search(rf'//{tok}(?![\w-])', val)                   # scheme://svc
-                        or re.search(rf'@{tok}(?![\w-])', val))                    # user:pw@svc
+            port = None
+            pm = re.search(rf'(?<![\w.-]){tok}:(\d+)', val)                        # svc:port
+            host_ref = pm or (re.search(rf'//{tok}(?![\w-])', val)                # scheme://svc
+                              or re.search(rf'@{tok}(?![\w-])', val))              # user:pw@svc
+            if pm: port = int(pm.group(1))
             if not host_ref and _ENV_LINK_KEY_RE.search(key):
                 host_ref = re.search(rf'(?<![\w.-]){tok}(?![\w-])', val)           # MAIL_HOST=svc
             if host_ref:
-                links.append((other, key))
+                links.append((other, key, port))
                 break
     return links
 
@@ -477,7 +480,7 @@ def _scan_docker(root):
                         sv['depends'].append(target_svc)
 
         infra, nodes, edges = [], [], []
-        edge_seen = set()
+        edge_by_pair = {}
         for sn, sv in svcs.items():
             t = _infer_service_type(sn, sv['image'])
             port = sv['ports'][0] if sv['ports'] else None
@@ -497,13 +500,20 @@ def _scan_docker(root):
             infra.append(entry)
             nodes.append(node)
             for dep in sv['depends']:
-                if dep in svcs and (sn, dep) not in edge_seen:
-                    edge_seen.add((sn, dep))
-                    edges.append({'from':sn,'to':dep,'label':'','kind':'depends_on'})
-            for target, key in _env_links(sn, sv.get('env'), all_svcs):
-                if (sn, target) not in edge_seen:
-                    edge_seen.add((sn, target))
-                    edges.append({'from':sn,'to':target,'label':key,'kind':'env'})
+                if dep in svcs and (sn, dep) not in edge_by_pair:
+                    edge_by_pair[(sn, dep)] = {'from':sn,'to':dep,'label':'','kind':'depends_on'}
+                    edges.append(edge_by_pair[(sn, dep)])
+            for target, key, port in _env_links(sn, sv.get('env'), all_svcs):
+                label = f"{key} :{port}" if port else key
+                existing = edge_by_pair.get((sn, target))
+                if existing:
+                    # depends_on already drew the arrow — the runtime link tells *why*, so prefer its label
+                    if not existing['label']:
+                        existing['label'] = label
+                        existing['env'] = key
+                else:
+                    edge_by_pair[(sn, target)] = {'from':sn,'to':target,'label':label,'kind':'env','env':key}
+                    edges.append(edge_by_pair[(sn, target)])
         return infra, {'description':f"Topology from {name}. Solid arrows: depends_on; labelled arrows: runtime links found in environment values.","nodes":nodes,"edges":edges}
     return [], {'description':'','nodes':[],'edges':[]}
 def _infer_desc(method, path, mod):

@@ -283,9 +283,12 @@ def test_docker_yaml_ports_profiles_depends_and_env_edges(build_html, fixture_pr
     assert sorted(edges) == [('api', 'kafka'), ('api', 'keycloak'), ('api', 'mailpit'), ('api', 'postgres'),
                              ('keycloak', 'postgres'), ('nginx', 'api'), ('nginx', 'keycloak')]
     assert edges[('api', 'postgres')]['kind'] == 'depends_on'        # map-form depends_on
-    assert edges[('nginx', 'api')]['kind'] == 'depends_on'           # flow-list depends_on
-    assert edges[('api', 'keycloak')] == {'from': 'api', 'to': 'keycloak', 'label': 'KEYCLOAK_ISSUER_URI', 'kind': 'env'}
+    assert edges[('api', 'postgres')]['label'] == 'SPRING_DATASOURCE_URL :5432'   # runtime label preferred
+    assert edges[('api', 'kafka')]['label'] == 'SPRING_KAFKA_BOOTSTRAP_SERVERS :9092'
+    assert edges[('nginx', 'api')] == {'from': 'nginx', 'to': 'api', 'label': 'UPSTREAM :8081', 'kind': 'depends_on', 'env': 'UPSTREAM'}
+    assert edges[('api', 'keycloak')] == {'from': 'api', 'to': 'keycloak', 'label': 'KEYCLOAK_ISSUER_URI :8080', 'kind': 'env', 'env': 'KEYCLOAK_ISSUER_URI'}
     assert edges[('api', 'mailpit')]['label'] == 'MAIL_HOST'
+    assert edges[('keycloak', 'postgres')]['label'] == ''            # no env hint → plain depends_on
     optional_nodes = [n['id'] for n in diagram['nodes'] if n.get('optional')]
     assert optional_nodes == ['mailpit']
 
@@ -340,7 +343,7 @@ def test_docker_diagram_html_has_styles_for_new_types(build_html, fixture_projec
     assert 'class keycloak auth;' in docker_src
     assert 'class mailpit mail;' in docker_src
     assert 'style mailpit stroke-dasharray' in docker_src
-    assert 'api -->|"KEYCLOAK_ISSUER_URI"| keycloak' in docker_src
+    assert 'api -->|"KEYCLOAK_ISSUER_URI :8080"| keycloak' in docker_src
 
 
 # ---------------------------------------------------------------- permissions
