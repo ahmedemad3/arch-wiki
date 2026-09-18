@@ -184,6 +184,8 @@ def _java_build_info(root):
                 dep_txt += '\n' + _read(os.path.join(r, f))
     if 'springdoc' in dep_txt: info['apiDocs'] = 'springdoc'
     elif 'springfox' in dep_txt: info['apiDocs'] = 'springfox'
+    info['actuator'] = 'spring-boot-starter-actuator' in dep_txt
+    info['prometheus'] = 'micrometer-registry-prometheus' in dep_txt
     if 'flyway' in dep_txt: info['migrations'] = 'flyway'
     elif 'liquibase' in dep_txt: info['migrations'] = 'liquibase'
     # A CLI task only exists when the build *plugin* is declared; otherwise migrations run at boot
@@ -2063,6 +2065,23 @@ def _project_version(root, fw):
     return None
 
 
+def _system_endpoints(fw, java_info=None):
+    """Framework-level operational endpoints. Spring Boot with Actuator exposes /actuator/*;
+    everything else keeps the conventional /health."""
+    java_info = java_info or {}
+    if fw in ('spring', 'java') and java_info.get('actuator'):
+        base = (java_info.get('contextPath') or '') + '/actuator'
+        eps = [
+            {"method": "GET", "path": f"{base}/health", "auth": False, "description": "Spring Boot Actuator health check"},
+            {"method": "GET", "path": f"{base}/info", "auth": False, "description": "Spring Boot Actuator build / git info"},
+        ]
+        if java_info.get('prometheus'):
+            eps.append({"method": "GET", "path": f"{base}/prometheus", "auth": False,
+                        "description": "Micrometer Prometheus scrape endpoint"})
+        return eps
+    return [{"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}]
+
+
 def init_architecture(target_root=None, placeholder_sql=False):
     """Scan the codebase and generate architecture.json automatically.
 
@@ -2209,9 +2228,7 @@ def init_architecture(target_root=None, placeholder_sql=False):
             "schemas": []
         },
         "modules": modules,
-        "systemEndpoints": [
-            {"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}
-        ],
+        "systemEndpoints": _system_endpoints(fw, java_info),
         "coreLayer": core_layer,
         "dataFlow": _build_data_flow(fw, core_layer),
         "permissions": permissions,

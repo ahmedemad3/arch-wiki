@@ -382,8 +382,8 @@ def test_permission_catalog_has_clean_slugs_and_public_count(build_html, fixture
     out_dir = os.path.join(root, 'docs', 'architecture')
     build_html.generate_html(data, out_dir)
     page = open(os.path.join(out_dir, 'architecture.html'), encoding='utf-8').read()
-    # 1 public route (/api/public/ping) + the synthetic /health system endpoint
-    assert '<div class="stat-num">2</div><div class="stat-lbl">Public Endpoints</div>' in page
+    # 1 public route (/api/public/ping) + 3 Actuator system endpoints
+    assert '<div class="stat-num">4</div><div class="stat-lbl">Public Endpoints</div>' in page
     assert '<div class="stat-num">19</div><div class="stat-lbl">Authenticated Endpoints</div>' in page
     assert '<div class="stat-num">5</div><div class="stat-lbl">Object-Level Checks</div>' in page
     assert 'object-level' in page
@@ -610,3 +610,13 @@ def test_workspaces_discover_nested_js_packages_next_to_gradle_modules(build_htm
 def test_workspaces_express_fixture_unchanged(build_html, fixture_project):
     assert build_html._scan_workspaces(fixture_project('express')) == [
         {'id': 'api', 'name': 'api', 'type': 'backend', 'description': 'Main REST API', 'port': 3000, 'entrypoint': 'src/index.ts'}]
+
+
+def test_system_endpoints_follow_actuator(build_html, fixture_project):
+    data = build_html.init_architecture(fixture_project('spring-kts'))
+    assert [e['path'] for e in data['systemEndpoints']] == ['/actuator/health', '/actuator/info', '/actuator/prometheus']
+    assert [e['path'] for e in build_html.init_architecture(fixture_project('express'))['systemEndpoints']] == ['/health']
+    assert build_html._system_endpoints('spring', {'actuator': False}) == [
+        {'method': 'GET', 'path': '/health', 'auth': False, 'description': 'Health check endpoint'}]
+    assert [e['path'] for e in build_html._system_endpoints('spring', {'actuator': True, 'contextPath': '/api'})] == [
+        '/api/actuator/health', '/api/actuator/info']
