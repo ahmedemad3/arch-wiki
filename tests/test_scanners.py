@@ -475,9 +475,12 @@ def test_spring_template_defaults_and_messaging(build_html, fixture_project):
     assert [(l['handler'], l['topics'], l['groupId']) for l in msg['listeners']] == [
         ('InvoiceEventsListener.onInvoice()', ['billing.invoice.created', 'billing.invoice.voided'], 'messaging'),
         ('InvoiceEventsListener.onPayment()', ['${acme.kafka.topics.payments}'], 'messaging')]
-    assert msg['producers'] == [{'broker': 'kafka', 'topic': 'billing.notifications',
-                                 'handler': 'NotificationPublisher.publish()',
-                                 'file': 'messaging/src/main/java/com/acme/messaging/NotificationPublisher.java'}]
+    assert msg['producers'] == [
+        {'broker': 'kafka', 'topic': 'billing.notifications', 'handler': 'NotificationPublisher.publish()',
+         'file': 'messaging/src/main/java/com/acme/messaging/NotificationPublisher.java'},
+        {'broker': 'kafka', 'topic': None, 'dynamic': True, 'expression': 'record',
+         'handler': 'OutboxPublisher.relay()',
+         'file': 'messaging/src/main/java/com/acme/messaging/OutboxPublisher.java'}]
 
     out_dir = os.path.join(root, 'docs', 'architecture')
     build_html.generate_html(data, out_dir)
@@ -527,3 +530,22 @@ def test_sql_tables_ignore_row_locks_and_cte_names(build_html):
                      paid (id) AS (SELECT invoice_id FROM payment)
                 UPDATE invoice SET status = 'LATE' FROM candidates WHERE invoice.id = candidates.id""") == ['invoice', 'payment']
     assert t("WITH RECURSIVE tree AS (SELECT * FROM org UNION ALL SELECT o.* FROM org o JOIN tree t ON o.parent = t.id) SELECT * FROM tree") == ['org']
+
+
+def test_messaging_producer_via_template_field(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java'; src.mkdir(parents=True)
+    (src / 'Bus.java').write_text("""
+        @Service public class Bus {
+            private static final String TOPIC = "orders.placed";
+            @Autowired private KafkaTemplate<String, Object> producer;
+            private final RabbitTemplate rabbit;
+            public void placed(Object o) { producer.send(TOPIC, o); }
+            public void notify(Object o) { rabbit.convertAndSend("notify.exchange", "email", o); }
+            public void raw(String topic, Object o) { producer.send(topic, o); }
+        }""")
+    prods = build_html._scan_messaging_java(str(tmp_path))['producers']
+    assert [(p['broker'], p['topic'], p.get('dynamic'), p['handler']) for p in prods] == [
+        ('kafka', 'orders.placed', None, 'Bus.placed()'),
+        ('rabbitmq', 'notify.exchange/email', None, 'Bus.notify()'),
+        ('kafka', None, True, 'Bus.raw()')]
+    assert prods[2]['expression'] == 'topic'

@@ -1504,22 +1504,38 @@ def _scan_messaging_java(root):
                 gid = _string_values(a['kw'].get('groupId'), consts)
                 if gid: entry['groupId'] = gid[0]
                 listeners.append(entry)
-            for m in re.finditer(r'\b(\w*(?:kafka|rabbit|jms)Template)\s*\.\s*(send|convertAndSend|sendDefault)\s*\(', code, re.IGNORECASE):
+            # Producer handles: any field/variable typed KafkaTemplate / RabbitTemplate / JmsTemplate,
+            # plus the conventional *kafkaTemplate / *rabbitTemplate / *jmsTemplate names.
+            handles = {}
+            for fm in re.finditer(r'\b(Kafka|Rabbit|Jms)Template\s*(?:<[^;{}()]*>)?\s+([A-Za-z_]\w*)\s*[;=,)]', code):
+                handles[fm.group(2)] = {'Kafka': 'kafka', 'Rabbit': 'rabbitmq', 'Jms': 'jms'}[fm.group(1)]
+            for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\.\s*(send|convertAndSend|sendDefault|executeInTransaction)\s*\(', code):
                 if _in_string(m.start(), spans): continue
+                var = m.group(1)
+                lv = var.lower()
+                broker = handles.get(var) or ('kafka' if 'kafkatemplate' in lv else ('rabbitmq' if 'rabbittemplate' in lv else ('jms' if 'jmstemplate' in lv else None)))
+                if not broker: continue
                 end = _balanced(code, m.end() - 1, spans)
                 args = _split_top_level(code[m.end():end - 1])
-                if not args: continue
-                broker = 'kafka' if 'kafka' in m.group(1).lower() else ('rabbitmq' if 'rabbit' in m.group(1).lower() else 'jms')
+                meth = next((n for st, n in reversed(methods) if st < m.start()), None)
+                entry = {'broker': broker, 'topic': None,
+                         'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel}
+                if m.group(2) == 'executeInTransaction' or not args:
+                    entry.update({'dynamic': True, 'expression': args[0].strip() if args else ''})
+                    producers.append(entry); continue
                 # rabbit convertAndSend(exchange, routingKey, payload) → "exchange/routingKey"
                 topic_args = args[:2] if (broker == 'rabbitmq' and len(args) >= 3) else args[:1]
-                names = []
+                names, unresolved = [], False
                 for ta in topic_args:
                     v = _string_values(ta, consts)
-                    names.append(v[0] if v else ta.strip())
-                topic = '/'.join(names)
-                meth = next((n for st, n in reversed(methods) if st < m.start()), None)
-                producers.append({'broker': broker, 'topic': topic,
-                                  'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel})
+                    if v: names.append(v[0])
+                    else: unresolved = True; names.append(ta.strip())
+                if unresolved:
+                    # send(record) / send(topicVar, payload) — topic decided at runtime (outbox pattern etc.)
+                    entry.update({'dynamic': True, 'expression': '/'.join(names)})
+                else:
+                    entry['topic'] = '/'.join(names)
+                producers.append(entry)
     return {'listeners': listeners, 'producers': producers}
 
 def _scan_workspaces(root):
@@ -4330,11 +4346,15 @@ flowchart TD
         <div class="grid2">
 """
         for pr in msg_producers:
+            if pr.get('topic'):
+                topic_html = f'<span class="tag tg">{html.escape(pr["topic"])}</span>'
+            else:
+                topic_html = f'<span class="tag ty" title="Topic is decided at runtime">dynamic topic</span> <code style="font-size:11px">{html.escape(pr.get("expression", ""))}</code>'
             html_content += f"""
             <div class="card">
                 <div class="card-title">{html.escape(pr.get('handler', ''))} <span class="tag tp">{html.escape(pr.get('broker', ''))}</span></div>
                 <div class="card-sub" style="margin-bottom:8px;">{html.escape(pr.get('file', ''))}</div>
-                <div><span class="tag tg">{html.escape(pr.get('topic', ''))}</span></div>
+                <div>{topic_html}</div>
             </div>
 """
         if not msg_producers:
