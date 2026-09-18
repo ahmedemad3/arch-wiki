@@ -1317,12 +1317,19 @@ def _sql_tables(sql, jpql=False):
     """Table (or JPQL entity) names referenced after FROM / JOIN / INTO / UPDATE."""
     s = re.sub(r"'(?:[^']|'')*'", "''", sql)                                   # drop string literals
     s = re.sub(r'\b(?:EXTRACT|SUBSTRING|TRIM|POSITION|OVERLAY)\s*\([^()]*\)', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bFOR\s+(?:UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b(?:\s+OF\s+[\w.,\s]+?)?(?:\s+(?:SKIP\s+LOCKED|NOWAIT))?',
+               ' ', s, flags=re.IGNORECASE)                                     # row-lock clause is not a table
+    # CTE names (WITH a AS (...), b AS (...)) are not tables either
+    ctes = set()
+    for wm in re.finditer(r'\b(?:WITH(?:\s+RECURSIVE)?|,)\s*([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s+AS\s*\(', s, re.IGNORECASE):
+        ctes.add(wm.group(1).lower())
     tables = []
     pat = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+(?:ONLY\s+|LATERAL\s+)?(?!SELECT\b|\(|VALUES\b)'
                      r'([`"\[]?[A-Za-z_][\w$]*[`"\]]?(?:\.[`"\[]?[A-Za-z_][\w$]*[`"\]]?)*)', re.IGNORECASE)
     for m in pat.finditer(s):
         t = re.sub(r'[`"\[\]]', '', m.group(1))
         if jpql and '.' in t: continue                                          # i.customer path expressions
+        if t.lower() in ctes: continue
         if t.upper() in ('DUAL', 'SET', 'WHERE', 'SELECT', 'UNNEST', 'GENERATE_SERIES', 'JSON_TABLE'): continue
         if t not in tables: tables.append(t)
     return tables

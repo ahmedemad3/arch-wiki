@@ -514,3 +514,16 @@ def test_express_and_fastapi_template_defaults_unchanged(build_html, fixture_pro
         sw = data['swaggerSchemas']
         assert (sw['openapi'], sw['servedAt'], sw['servers'][0]['url']) == ('3.0.0', '/api/docs', 'http://localhost:3000')
         assert data['messaging'] == {'listeners': [], 'producers': []}
+
+
+# ---------------------------------------------------------------- follow-up findings (Orbit run)
+
+def test_sql_tables_ignore_row_locks_and_cte_names(build_html):
+    t = build_html._sql_tables
+    assert t("SELECT * FROM outbox_event WHERE status = 'NEW' ORDER BY id FOR UPDATE SKIP LOCKED") == ['outbox_event']
+    assert t("SELECT id FROM job FOR UPDATE NOWAIT") == ['job']
+    assert t("SELECT id FROM job j JOIN run r ON r.job_id = j.id FOR UPDATE OF j SKIP LOCKED") == ['job', 'run']
+    assert t("""WITH candidates AS (SELECT id FROM invoice WHERE due < now()),
+                     paid (id) AS (SELECT invoice_id FROM payment)
+                UPDATE invoice SET status = 'LATE' FROM candidates WHERE invoice.id = candidates.id""") == ['invoice', 'payment']
+    assert t("WITH RECURSIVE tree AS (SELECT * FROM org UNION ALL SELECT o.* FROM org o JOIN tree t ON o.parent = t.id) SELECT * FROM tree") == ['org']
