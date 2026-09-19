@@ -564,6 +564,13 @@ def test_meta_version_from_build_files(build_html, fixture_project, tmp_path):
     (mvn / 'pom.xml').write_text('<project><parent><artifactId>spring-boot-starter-parent</artifactId><version>3.4.2</version></parent>'
                                  '<artifactId>x</artifactId><version>7.0.0-SNAPSHOT</version></project>')
     assert build_html._project_version(str(mvn), 'spring') == '7.0.0-SNAPSHOT'
+    # the helper is self-contained: package.json and a default, never None
+    js = tmp_path / 'js'; js.mkdir()
+    (js / 'package.json').write_text('{"name": "x", "version": "2.5.0"}')
+    assert build_html._project_version(str(js), 'express') == '2.5.0'
+    empty = tmp_path / 'empty'; empty.mkdir()
+    assert build_html._project_version(str(empty), 'spring') == '1.0.0'
+    assert build_html._project_version(str(empty), 'express', default='0.0.0') == '0.0.0'
 
 
 def test_migration_step_only_invents_task_with_plugin(build_html, tmp_path):

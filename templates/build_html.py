@@ -2137,9 +2137,21 @@ def _apply_overrides(data, root, arch_dir):
     return result
 
 
-def _project_version(root, fw):
-    """Project version: VERSION file, then the build file (Gradle `version = "x"`, POM <version>,
-    pyproject/setup version). package.json is handled by the caller."""
+def _project_version(root, fw, default='1.0.0'):
+    """Project version, never None: VERSION file, then the build file for the framework
+    (Gradle `version = "x"`, the POM's own <version>, pyproject.toml), then package.json,
+    then `default`."""
+    v = _project_version_or_none(root, fw)
+    if v: return v
+    for pkg_loc in (os.path.join(root, 'package.json'), os.path.join(root, 'backend', 'package.json')):
+        try:
+            pv = json.load(open(pkg_loc, encoding='utf-8')).get('version')
+            if pv: return str(pv)
+        except Exception:
+            pass
+    return default
+
+def _project_version_or_none(root, fw):
     for name in ('VERSION', 'VERSION.txt', 'version.txt'):
         v = _read(os.path.join(root, name)).strip().splitlines()
         if v and re.match(r'^v?\d[\w.\-+]*$', v[0].strip()):
@@ -2198,17 +2210,15 @@ def init_architecture(target_root=None, placeholder_sql=False):
 
     proj_name = None
     proj_desc = None
-    proj_version = None
     for pkg_loc in [os.path.join(root, 'package.json'), os.path.join(root, 'backend', 'package.json')]:
         if os.path.isfile(pkg_loc):
             try:
                 d = json.load(open(pkg_loc, encoding='utf-8'))
                 if d.get('name'): proj_name = d.get('name')
                 if d.get('description'): proj_desc = d.get('description')
-                if d.get('version') and not proj_version: proj_version = str(d['version'])
                 if proj_name and proj_desc: break
             except: pass
-    proj_version = _project_version(root, fw) or proj_version or '1.0.0'
+    proj_version = _project_version(root, fw)
     if not proj_name or proj_name in ('arch-wiki', 'template'):
         proj_name = os.path.basename(root)
     if not proj_desc:
