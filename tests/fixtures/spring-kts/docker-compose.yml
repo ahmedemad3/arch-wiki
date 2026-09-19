@@ -1,0 +1,48 @@
+services:
+  api:
+    build:
+      context: .
+    ports: ["127.0.0.1:8081:8081"]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/acme
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/acme
+      MAIL_HOST: mailpit
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+
+  postgres:
+    image: postgres:17-alpine
+    ports: ["5432:5432"]
+
+  kafka:
+    image: apache/kafka:3.9.0
+    ports:
+      - "9092:9092"
+      - target: 9093
+        published: 9093
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+  mailpit:
+    image: axllent/mailpit:latest
+    profiles: ["dev"]
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+  nginx:
+    image: nginx:1.27
+    ports: ["80:80", "443:443"]
+    environment:
+      UPSTREAM: api:8081
+    depends_on: [api, keycloak]

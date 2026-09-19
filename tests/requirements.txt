@@ -1,0 +1,4 @@
+# Test-only dependencies. templates/build_html.py itself is stdlib-only;
+# PyYAML is optional at runtime and improves docker-compose parsing.
+pytest>=7
+pyyaml>=6

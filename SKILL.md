@@ -55,6 +55,8 @@ Ask the user (or infer from context) exactly what changed:
 **1. Copy Template Script (if not present):**
 Check if `docs/architecture/build_html.py` exists in the target project workspace.
 If missing, ensure directory `docs/architecture` exists and copy `build_html.py` from the `arch-wiki` skill templates directory into `docs/architecture/build_html.py`.
+If the project needs scanner corrections, also copy `templates/arch_overrides.example.py` to
+`docs/architecture/arch_overrides.py` (see the override hook below).
 
 **2. Run Script Execution:**
 
@@ -64,15 +66,58 @@ If missing, ensure directory `docs/architecture` exists and copy `build_html.py`
   ```
   *Scans project root metadata (`package.json`), Docker topology (`docker-compose.yml`), and API routes to create `architecture.json` and generate `architecture.html`.*
 
+  Framework detection looks for `pom.xml`, `build.gradle` **or `build.gradle.kts` / `settings.gradle.kts`**
+  (Spring Boot, Maven or Gradle incl. Kotlin DSL), then `package.json` (Express / NestJS / Fastify),
+  then Python manifests (FastAPI / Django / Flask). For Java projects the Java and Spring Boot
+  versions in `meta.techStack` are read from the build file (toolchain / `sourceCompatibility` /
+  `<java.version>`, Spring Boot plugin or parent version, `gradle/libs.versions.toml`), and Gradle
+  sub-projects from `settings.gradle(.kts)` become `workspaces`.
+
 - **Incremental Sync (After Adding Features / Endpoints / Queries):**
   ```bash
   python docs/architecture/build_html.py --sync
   ```
   *Re-scans codebase for new endpoints, permissions, and SQL queries, updates `architecture.json`, and rebuilds `architecture.html`.*
 
+- **SQL catalog for Java / Spring projects:** `sqlQueries` is extracted from the sources —
+  `@Query` / `@NativeQuery` / `@NamedQuery` (JPQL vs `nativeQuery = true`), Java text blocks,
+  and `"…" + "…"` string chains that start with `SELECT` / `INSERT` / `UPDATE` / `DELETE` /
+  `WITH` / `MERGE` (JdbcTemplate, EntityManager, …). Each query is attributed to its enclosing
+  class and method (`function`), gets a `queryType` of `jpql` | `native` | `sql`, and its
+  `tables` from `FROM` / `JOIN` / `INTO` / `UPDATE`. `endpoints` is left empty rather than
+  guessed — fill it by hand or through the override hook when you know the mapping.
+  The legacy behaviour (one templated statement per endpoint, referencing guessed table names)
+  is available with:
+  ```bash
+  python docs/architecture/build_html.py --init --placeholder-sql
+  ```
+  Express / NestJS / FastAPI projects keep the placeholder catalog unchanged.
+
 > [!NOTE]
 > The codebase scanner automatically excludes build artifacts (`dist/`, `build/`, `node_modules/`)
 > to prevent duplicate route modules and sanitizes diagram nodes for error-free Mermaid rendering.
+
+**3. Project override hook (optional):**
+
+Many projects have a better source of truth than any generic scanner — a permission catalog
+file, a frontend API client that maps calls to pages, a hand-maintained list of which SQL
+queries serve which endpoints. If `docs/architecture/arch_overrides.py` exists, `--init` /
+`--sync` import it after all scanners have run and call:
+
+```python
+def apply(data: dict, root: str) -> dict | None
+```
+
+- `data` is the complete manifest (every section of `architecture.json`); `root` is the absolute
+  project root. Mutate `data` in place or return a new dict; returning `None` keeps `data`.
+- The returned manifest is written as-is. Only `swaggerSchemas.matchStatus` is recomputed, so if
+  the hook changes endpoint permissions it should rebuild the catalog with
+  `import build_html; data["permissions"] = build_html.build_permissions(data["modules"])`.
+- Exceptions abort the run (the traceback names the hook file), so a stale catalog fails loudly.
+  Pass `--skip-overrides` to run the raw scanners without the hook (handy while writing it).
+- Start from `templates/arch_overrides.example.py` in the skill directory — it shows merging a
+  `permissions.json` catalog, attributing endpoints to frontend pages, and correcting service
+  descriptions. Copy it to `docs/architecture/arch_overrides.py` and edit.
 
 ---
 
@@ -106,13 +151,25 @@ Add a new entry for each Docker container/service:
 {
   "id": "service-id",
   "name": "Display Name + version",
-  "type": "database|cache|queue|proxy|monitoring|logging|uptime",
+  "type": "app|database|cache|queue|auth|mail|voice|proxy|monitoring|logging|uptime|search|storage|registry|config",
   "image": "docker-image:tag",
   "port": 1234,
+  "ports": [1234, 1235],
+  "optional": true,
+  "profiles": ["dev"],
   "description": "What it does in this system",
   "features": ["feature 1", "feature 2"]
 }
 ```
+`ports` / `optional` / `profiles` are only present when relevant. Compose files are found at the
+project root **or up to two folders down** (`deployment/`, `docker/`, `infra/` …); several files
+are merged (first definition of a service wins, override files after their base) and each service
+then records its `source` file. The scanner uses **PyYAML when installed** (`pip install pyyaml`,
+also listed in `tests/requirements.txt`) and understands every `ports:` form (`"5432:5432"`, flow lists,
+`"127.0.0.1:8080:8080"`, ranges, `/udp`, long `target/published` syntax), `profiles:` (→ `optional`),
+`depends_on` in list and map form, and YAML anchors. Without PyYAML a simpler line parser handles
+2-space-indented block-style files. Types are inferred from the image name (`keycloak` → auth,
+`kafka` → queue, `mailpit` → mail, `asterisk` → voice, `nginx` → proxy, `prometheus` → monitoring, …).
 
 #### 4. `dockerDiagram`
 Extracted from `docker-compose.yml` for rendering the container topology Mermaid diagram:
@@ -120,13 +177,17 @@ Extracted from `docker-compose.yml` for rendering the container topology Mermaid
 {
   "description": "Container topology extracted from docker-compose.yml. Arrows represent network dependencies.",
   "nodes": [
-    { "id": "node_id", "label": "Container Name", "type": "app|database|cache|queue|proxy|monitoring|logging|uptime", "port": 3000 }
+    { "id": "node_id", "label": "Container Name", "type": "app|database|cache|queue|auth|mail|voice|proxy|monitoring|logging|uptime|search|storage|registry|config", "port": 3000, "optional": false }
   ],
   "edges": [
-    { "from": "api", "to": "postgres", "label": "TCP 5432" }
+    { "from": "api", "to": "postgres", "label": "TCP 5432", "kind": "depends_on" },
+    { "from": "api", "to": "keycloak", "label": "KEYCLOAK_ISSUER_URI", "kind": "env" }
   ]
 }
 ```
+Edges come from `depends_on` **and** from environment values that reference another service as a
+host (`svc:port`, `//svc`, `user:pw@svc`, or any key matching `HOST|URL|URI|UPSTREAM|BROKERS|SERVERS|ADDR|ENDPOINT`
+whose value names the service). Optional (profile-gated) nodes render with a dashed outline.
 
 #### 5. `systemArchitectureDiagram`
 High-level software component and system design diagram rendered via Mermaid:
@@ -155,6 +216,7 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
   "matchStatus": "Verified Parity (67/67 Endpoints)",
   "openapi": "3.0.0",
   "servedAt": "/api/docs",
+  "swaggerUi": "/swagger-ui.html  (optional — UI route when it differs from servedAt)",
   "securityScheme": "bearerAuth (JWT Bearer Token)",
   "servers": [
     { "url": "http://localhost:3000", "description": "Local Development Server" },
@@ -165,6 +227,12 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
   ]
 }
 ```
+`servers[0].url` is what the dashboard shows as **Base URL** and uses in every cURL snippet, and
+`openapi` is the version written into the generated spec. Spring projects default to
+`/v3/api-docs`, `/swagger-ui.html` and OpenAPI `3.1.0` when springdoc is on the classpath
+(`/v2/api-docs` for springfox), with the local URL built from `server.port` /
+`server.servlet.context-path` in `application.{yml,properties}` (fallback 8080).
+Express / NestJS / FastAPI keep `/api/docs` on port 3000.
 
 #### 7. `modules`
 **Adding a new module:**
@@ -184,11 +252,31 @@ Spec metadata and match status for the interactive Swagger UI and OpenAPI JSON g
       "path": "/path",
       "auth": true,
       "permission": "module:read or null",
-      "description": "What this endpoint does"
+      "description": "What this endpoint does",
+      "handler": "ControllerClass.methodName (optional, filled by the Spring scanner)",
+      "permissionExpression": "hasAuthority('module:read') and @acl.canRead(#id)  (optional, raw source expression)",
+      "objectLevel": true
     }
   ]
 }
 ```
+
+`permission` is always a plain slug (or `a | b` for alternatives). For Spring, `@PreAuthorize`
+SpEL is normalised — `hasAuthority('x')` → `x`, `hasAnyAuthority('a','b')` → `a | b`,
+`hasRole('ADMIN')` → `ROLE_ADMIN`, `isAuthenticated()` → `auth: true` with no slug,
+`permitAll()` → `auth: false` — and the raw expression is kept in `permissionExpression`.
+`objectLevel: true` marks endpoints whose check also depends on the target object
+(`@bean.method(...)`, `hasPermission(...)`, `#param` references). The "Public Endpoints" stat
+counts endpoints with `auth: false`; "Authenticated" counts `auth: true`.
+
+> [!NOTE]
+> **Spring:** the scanner parses every path of a mapping annotation (`@RequestMapping({"/a", "/b"})`,
+> `value = {...}`, `path =` in any attribute position, `method = {POST, PUT}`) and emits one endpoint
+> per class-level base × method path. A module's `basePath` is the longest common prefix of its
+> controllers' class-level mappings and every endpoint `path` is relative to it, so
+> `basePath + path` is always the real route. `@Operation(summary)` becomes the description,
+> `@Tag(description)` the module description; `@PreAuthorize` / `@RolesAllowed` / `@Secured` are
+> read anywhere in the method's annotation block, falling back to the class-level annotation.
 
 #### 8. `permissions`
 Keep `catalog` array sorted by module prefix.
@@ -203,13 +291,16 @@ Update `details` array with interactive flow connections:
       "module": "Users",
       "action": "UPDATE",
       "endpoints": [
-        { "method": "PUT", "path": "/api/v1/users/:id" }
+        { "method": "PUT", "path": "/api/v1/users/:id", "objectLevel": true }
       ],
-      "adminPages": ["User Management", "Edit User Form"]
+      "adminPages": ["User Management", "Edit User Form"],
+      "objectLevel": true,
+      "expressions": ["hasAuthority('users:write') and @acl.owns(#id)"]
     }
   ]
 }
 ```
+`objectLevel` and `expressions` are optional and filled by the Spring scanner.
 
 #### 9. `sqlQueries`
 Catalog mapping raw SQL statements or query builders to repository functions and endpoints:
@@ -222,12 +313,29 @@ Catalog mapping raw SQL statements or query builders to repository functions and
   "function": "RepositoryClass.methodName()",
   "tables": ["table1", "table2"],
   "purpose": "Detailed explanation of what the query accomplishes",
+  "queryType": "sql | jpql | native  (set by the Java extractor; optional otherwise)",
   "sql": "SELECT ... FROM table1 JOIN table2 ...",
   "endpoints": [
     { "method": "GET", "path": "/api/v1/module/resource" }
   ]
 }
 ```
+
+#### 10. `messaging` (optional)
+Consumers and producers found by the Java scanner (`@KafkaListener`, `@RabbitListener`,
+`@JmsListener`, `@SqsListener`, `*Template.send()` / `convertAndSend()`). The **Messaging** tab
+only appears when this section is non-empty:
+```json
+{
+  "listeners": [
+    { "broker": "kafka", "topics": ["billing.invoice.created"], "groupId": "billing", "handler": "InvoiceEventsListener.onInvoice()", "file": "…/InvoiceEventsListener.java" }
+  ],
+  "producers": [
+    { "broker": "kafka", "topic": "billing.notifications", "handler": "NotificationPublisher.publish()", "file": "…/NotificationPublisher.java" }
+  ]
+}
+```
+Topics given as `${property}` placeholders are kept verbatim.
 
 ---
 
@@ -258,7 +366,9 @@ Verify `docs/architecture/architecture.html`:
    - **API Catalog & cURL:** Endpoint list with copyable `cURL` request snippets.
    - **OpenAPI 3.0 JSON Spec:** Formatted JSON specification with 1-click copy button.
 5. **Interactive Diagrams:** System Architecture and Docker Topology render cleanly via Mermaid.js with interactive pan/zoom toolbars and hand (grab) cursor feedback.
-6. **SQL Queries:** Full system query catalog displayed with syntax highlighting and mapped endpoints.
+6. **SQL Queries:** Query catalog rendered lazily from embedded JSON (50 cards at a time with a
+   filter box, so pages with hundreds of queries stay small); PDF export renders the full list.
+7. **Messaging (Java only, when present):** Kafka / RabbitMQ / JMS listeners and producers with their topics.
 
 ---
 

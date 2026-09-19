@@ -1,0 +1,17 @@
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+      - redis
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"

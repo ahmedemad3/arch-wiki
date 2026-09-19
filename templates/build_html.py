@@ -91,7 +91,8 @@ def _find_root(start):
     Checks for markers like docker-compose.yml, package.json, backend/, .git, etc."""
     markers = [
         'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', '.git',
-        'package.json', 'requirements.txt', 'go.mod', 'Gemfile', 'pom.xml', 'Cargo.toml', 'composer.json'
+        'package.json', 'requirements.txt', 'go.mod', 'Gemfile', 'pom.xml', 'Cargo.toml', 'composer.json',
+        'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts'
     ]
     cur = os.path.abspath(start)
     for _ in range(5):
@@ -105,12 +106,112 @@ def _find_root(start):
         cur = parent
     return os.path.abspath(os.path.join(start, "..", ".."))  # default to 2 levels up from docs/architecture
 
-def _detect_fw(root):
+_JAVA_BUILD_FILES = ['pom.xml', 'build.gradle.kts', 'build.gradle', 'settings.gradle.kts', 'settings.gradle']
+
+def _java_build_file(root):
+    """Return the path of the first Maven/Gradle build file found at root or a common sub-dir, else None."""
     for sub in ['', 'app', 'server', 'backend', 'apps/api', 'apps/server', 'apps/backend']:
-        if os.path.isfile(os.path.join(root, sub, 'pom.xml')) or os.path.isfile(os.path.join(root, 'pom.xml')):
-            return 'spring'
-        if os.path.isfile(os.path.join(root, sub, 'build.gradle')) or os.path.isfile(os.path.join(root, 'build.gradle')):
-            return 'spring'
+        for bf in _JAVA_BUILD_FILES:
+            p = os.path.join(root, sub, bf) if sub else os.path.join(root, bf)
+            if os.path.isfile(p):
+                return p
+    return None
+
+def _read(path):
+    try:
+        return open(path, encoding='utf-8', errors='ignore').read()
+    except Exception:
+        return ''
+
+def _java_build_info(root):
+    """Derive build tool, Java and Spring Boot versions from pom.xml / build.gradle(.kts).
+
+    Returns a dict: {'buildTool': 'maven'|'gradle'|None, 'buildFile': rel path or None,
+    'kotlinDsl': bool, 'javaVersion': '25'|None, 'springBootVersion': '4.0.0'|None}.
+    """
+    info = {'buildTool': None, 'buildFile': None, 'kotlinDsl': False,
+            'javaVersion': None, 'springBootVersion': None,
+            'apiDocs': None, 'migrations': None, 'serverPort': None, 'contextPath': ''}
+    bf = _java_build_file(root)
+    if not bf:
+        return info
+    bdir = os.path.dirname(bf)
+    is_maven = os.path.basename(bf) == 'pom.xml'
+    info['buildTool'] = 'maven' if is_maven else 'gradle'
+    # Prefer the build script over settings when both exist (versions live there)
+    if not is_maven:
+        for cand in ['build.gradle.kts', 'build.gradle']:
+            if os.path.isfile(os.path.join(bdir, cand)):
+                bf = os.path.join(bdir, cand); break
+    info['buildFile'] = os.path.relpath(bf, root).replace('\\', '/')
+    info['kotlinDsl'] = bf.endswith('.kts')
+    txt = _read(bf)
+
+    if is_maven:
+        jv = (re.search(r'<java\.version>\s*([\d.]+)\s*</java\.version>', txt)
+              or re.search(r'<maven\.compiler\.(?:release|source|target)>\s*([\d.]+)\s*<', txt)
+              or re.search(r'<release>\s*([\d.]+)\s*</release>', txt))
+        if jv: info['javaVersion'] = jv.group(1)
+        sb = re.search(r'<artifactId>spring-boot-starter-parent</artifactId>\s*<version>([^<]+)</version>', txt)
+        if not sb:
+            sb = re.search(r'<artifactId>spring-boot(?:-dependencies)?</artifactId>\s*<version>([^<]+)</version>', txt)
+        if not sb:
+            sb = re.search(r'<spring-boot\.version>([^<]+)</spring-boot\.version>', txt)
+        if sb: info['springBootVersion'] = sb.group(1).strip()
+    else:
+        jv = (re.search(r'JavaLanguageVersion\.of\(\s*(\d+)\s*\)', txt)
+              or re.search(r'(?:sourceCompatibility|targetCompatibility)\s*=\s*(?:JavaVersion\.VERSION_)?["\']?(\d+(?:_\d+)?)', txt)
+              or re.search(r'options\.release(?:\.set)?\s*[=(]\s*(\d+)', txt))
+        if jv: info['javaVersion'] = jv.group(1).replace('1_', '1.').replace('_', '.')
+        sb = re.search(r'["\']org\.springframework\.boot["\']\s*\)?\s*version\s*\(?\s*["\']([^"\']+)["\']', txt)
+        if not sb:
+            # Version catalog: gradle/libs.versions.toml → spring-boot = "4.0.0"
+            toml = _read(os.path.join(root, 'gradle', 'libs.versions.toml'))
+            sb = re.search(r'^\s*spring[-_.]?boot\s*=\s*["\']([^"\']+)["\']', toml, re.MULTILINE)
+        if sb: info['springBootVersion'] = sb.group(1).strip()
+    # Java version may live in the version catalog or gradle.properties too
+    if not info['javaVersion'] and not is_maven:
+        for extra in [os.path.join(root, 'gradle', 'libs.versions.toml'), os.path.join(root, 'gradle.properties')]:
+            m = re.search(r'^\s*(?:java|jdk)(?:[-_.]?version)?\s*=\s*["\']?(\d+)', _read(extra), re.MULTILINE)
+            if m: info['javaVersion'] = m.group(1); break
+
+    # Dependencies that decide API-docs routes and migration tooling (root + sub-project build files)
+    dep_txt = txt
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', '.gradle')]
+        for f in fls:
+            if f in ('pom.xml', 'build.gradle', 'build.gradle.kts'):
+                dep_txt += '\n' + _read(os.path.join(r, f))
+    if 'springdoc' in dep_txt: info['apiDocs'] = 'springdoc'
+    elif 'springfox' in dep_txt: info['apiDocs'] = 'springfox'
+    info['actuator'] = 'spring-boot-starter-actuator' in dep_txt
+    info['prometheus'] = 'micrometer-registry-prometheus' in dep_txt
+    if 'flyway' in dep_txt: info['migrations'] = 'flyway'
+    elif 'liquibase' in dep_txt: info['migrations'] = 'liquibase'
+    # A CLI task only exists when the build *plugin* is declared; otherwise migrations run at boot
+    info['migrationPlugin'] = bool(re.search(
+        r'org\.flywaydb\.flyway|flyway-maven-plugin|org\.liquibase\.gradle|liquibase-maven-plugin|liquibase\.plugin', dep_txt))
+
+    # server.port / context-path from the first application.{yml,yaml,properties} outside tests
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', 'test')]
+        for f in sorted(fls):
+            if not re.match(r'application(?:-(?:dev|local|default))?\.(?:ya?ml|properties)$', f): continue
+            cfg = _read(os.path.join(r, f))
+            if f.endswith('.properties'):
+                pm = re.search(r'^\s*server\.port\s*[=:]\s*(\d+)', cfg, re.MULTILINE)
+                cm = re.search(r'^\s*server\.servlet\.context-path\s*[=:]\s*(\S+)', cfg, re.MULTILINE)
+            else:
+                pm = re.search(r'^server:\s*\n(?:[ \t]+.*\n)*?[ \t]+port:\s*["\']?(\d+)', cfg, re.MULTILINE)
+                cm = re.search(r'context-path:\s*["\']?([^\s"\']+)', cfg)
+            if pm and not info['serverPort']: info['serverPort'] = int(pm.group(1))
+            if cm and not info['contextPath']: info['contextPath'] = cm.group(1).rstrip('/')
+        if info['serverPort']: break
+    return info
+
+def _detect_fw(root):
+    if _java_build_file(root):
+        return 'spring'
     for sub in ['', 'backend', 'api', 'server', 'app', 'apps/api', 'apps/server', 'apps/backend']:
         pkg = os.path.join(root, sub, 'package.json') if sub else os.path.join(root, 'package.json')
         if os.path.isfile(pkg):
@@ -164,59 +265,251 @@ def _detect_fw(root):
                 except: pass
     return 'unknown'
 
+try:
+    import yaml as _yaml
+except ImportError:  # PyYAML is optional — the line-based parser below is the fallback
+    _yaml = None
+
+# Ordered: first match on the image basename (then the service name) wins.
+_SERVICE_TYPE_HINTS = [
+    ('monitoring', ['kafka-ui', 'kafdrop', 'redpanda-console', 'pgadmin', 'adminer', 'mongo-express',
+                    'redis-commander', 'redisinsight', 'prometheus', 'grafana', 'jaeger', 'zipkin', 'otel',
+                    'opentelemetry', 'tempo', 'loki', 'alertmanager', 'cadvisor', 'exporter', 'datadog',
+                    'sentry', 'glitchtip', 'signoz', 'monitoring']),
+    ('uptime',     ['uptime-kuma', 'uptime']),
+    ('logging',    ['elasticsearch', 'opensearch', 'kibana', 'logstash', 'fluentd', 'fluent-bit', 'graylog', 'seq']),
+    ('search',     ['meilisearch', 'typesense', 'solr', 'search']),
+    ('database',   ['postgres', 'pgvector', 'timescale', 'mysql', 'mariadb', 'mongo', 'mssql', 'sqlserver',
+                    'oracle', 'cockroach', 'cassandra', 'scylla', 'clickhouse', 'neo4j', 'couchdb', 'dynamodb',
+                    'influx', 'questdb', 'db2', 'database', '-db']),
+    ('cache',      ['redis', 'valkey', 'memcached', 'keydb', 'dragonfly', 'hazelcast', 'cache']),
+    ('queue',      ['kafka', 'redpanda', 'zookeeper', 'rabbitmq', 'nats', 'activemq', 'artemis', 'pulsar',
+                    'mosquitto', 'emqx', 'broker', 'queue']),
+    ('auth',       ['keycloak', 'authentik', 'hydra', 'kratos', 'zitadel', 'dex', 'authelia', 'fusionauth',
+                    'logto', 'oauth2-proxy', 'auth']),
+    ('mail',       ['mailpit', 'mailhog', 'maildev', 'mailcatcher', 'greenmail', 'inbucket', 'postfix', 'smtp', 'mail']),
+    ('voice',      ['asterisk', 'freeswitch', 'kamailio', 'opensips', 'coturn', 'rtpengine', 'jitsi', 'janus',
+                    'mediasoup', 'livekit', 'sip', 'voice', 'pbx']),
+    ('proxy',      ['nginx', 'traefik', 'haproxy', 'caddy', 'envoy', 'kong', 'apisix', 'tyk', 'cloudflared',
+                    'ngrok', 'gateway', 'ingress', 'proxy']),
+    ('storage',    ['minio', 'localstack', 'azurite', 'ceph', 'garage', 'sftp', 'ftp', 's3', 'blob', 'storage']),
+    ('registry',   ['registry', 'eureka', 'consul', 'nacos']),
+    ('config',     ['config', 'vault', 'etcd']),
+]
+
+def _infer_service_type(name, image):
+    """Service type from the image basename (quay.io/keycloak/keycloak:26 → keycloak), then the name."""
+    base = (image or '').split('/')[-1].split(':')[0].split('@')[0].lower()
+    for cand in (base, (name or '').lower()):
+        if not cand: continue
+        for stype, keys in _SERVICE_TYPE_HINTS:
+            if any(k in cand for k in keys):
+                return stype
+    if re.fullmatch(r'(?:.*[-_])?db(?:[-_].*)?', (name or '').lower()):   # db, app-db, db_primary
+        return 'database'
+    return 'app'
+
+def _compose_port(entry):
+    """Published host port from any compose `ports:` form, else the container port, else None.
+
+    Handles 5432, "5432", "5432:5432", "127.0.0.1:8080:8080", "[::1]:8080:8080",
+    "8080-8081:8080-8081", "9092:9092/udp" and the long {target, published} syntax."""
+    def _first(v):
+        m = re.match(r'\s*(\d+)', str(v))
+        return int(m.group(1)) if m else None
+    if isinstance(entry, bool) or entry is None: return None
+    if isinstance(entry, int): return entry
+    if isinstance(entry, dict):
+        return _first(entry.get('published')) or _first(entry.get('target'))
+    s = str(entry).strip().strip('"\'')
+    s = re.sub(r'/(?:tcp|udp|sctp)$', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^\[[^\]]*\]:', 'ipv6:', s)              # [::1]:8080:80 → ipv6:8080:80
+    parts = s.split(':')
+    if len(parts) == 1: return _first(parts[0])
+    if len(parts) == 2: return _first(parts[0])
+    return _first(parts[-2])                              # host:published:target
+
+def _compose_env(raw):
+    """environment: as a dict, from either mapping or ["K=V", …] list form."""
+    env = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            env[str(k)] = '' if v is None else str(v)
+    elif isinstance(raw, list):
+        for item in raw:
+            k, _, v = str(item).partition('=')
+            env[k.strip()] = v.strip()
+    return env
+
+def _parse_compose_yaml(path):
+    """docker-compose services via PyYAML → {name: {image, build, ports, depends, profiles, env}}."""
+    class _Loader(_yaml.SafeLoader):
+        pass
+    # unknown tags (!reset, !override) must not abort the scan
+    _Loader.add_multi_constructor('!', lambda loader, suffix, node: None)
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        doc = _yaml.load(f, Loader=_Loader) or {}
+    services = doc.get('services') if isinstance(doc, dict) else None
+    if not isinstance(services, dict): return {}
+    svcs = {}
+    for sn, sv in services.items():
+        if not isinstance(sv, dict): sv = {}
+        build = sv.get('build')
+        if isinstance(build, dict): build = build.get('context', '.')
+        ports = [p for p in (_compose_port(e) for e in (sv.get('ports') or [])) if p]
+        deps_raw = sv.get('depends_on') or []
+        deps = list(deps_raw.keys()) if isinstance(deps_raw, dict) else [str(d) for d in deps_raw]
+        profiles = sv.get('profiles') or []
+        svcs[str(sn)] = {
+            'image': str(sv.get('image') or ''),
+            'build': str(build or ''),
+            'ports': ports,
+            'depends': [str(d) for d in deps],
+            'profiles': [str(p) for p in (profiles if isinstance(profiles, list) else [profiles])],
+            'env': _compose_env(sv.get('environment')),
+        }
+    return svcs
+
+def _parse_compose_lines(lines):
+    """Fallback parser used when PyYAML is not installed (2-space indented block style only)."""
+    svcs, cur = {}, None
+    in_svc, in_dep = False, False
+    dep_indent = 0
+
+    for ln in lines:
+        s = ln.rstrip()
+        if not s or s.startswith('#'): continue
+
+        if re.match(r'^[a-zA-Z0-9_\-]+:', s):
+            in_svc = s.startswith('services:')
+            cur = None; in_dep = False
+            continue
+        if not in_svc: continue
+
+        m = re.match(r'^  ([a-zA-Z0-9_\-]+):\s*$', s)
+        if m:
+            cur = m.group(1)
+            svcs[cur] = {'image':'','ports':[],'depends':[],'build':'','profiles':[],'env':{}}
+            in_dep = False; continue
+        if not cur: continue
+
+        if re.match(r'^\s+image:\s+', s): svcs[cur]['image'] = s.split('image:')[1].strip()
+        if re.match(r'^\s+context:\s+', s): svcs[cur]['build'] = s.split('context:')[1].strip()
+        pm = re.match(r'^\s+ports:\s*\[(.*)\]\s*$', s)
+        if pm:
+            for item in pm.group(1).split(','):
+                p = _compose_port(item.strip())
+                if p: svcs[cur]['ports'].append(p)
+        pm = re.match(r'^\s+-\s*["\']?([\d.:\[\]a-fA-F\-]+(?:/\w+)?)["\']?\s*$', s)
+        if pm and not in_dep:
+            p = _compose_port(pm.group(1))
+            if p: svcs[cur]['ports'].append(p)
+        pf = re.match(r'^\s+profiles:\s*\[(.*)\]', s)
+        if pf: svcs[cur]['profiles'] = [x.strip().strip('"\'') for x in pf.group(1).split(',') if x.strip()]
+
+        dm_start = re.match(r'^(\s+)depends_on:\s*(\[.*\])?\s*$', s)
+        if dm_start:
+            if dm_start.group(2):
+                svcs[cur]['depends'] = [x.strip().strip('"\'') for x in dm_start.group(2)[1:-1].split(',') if x.strip()]
+                continue
+            in_dep = True
+            dep_indent = len(dm_start.group(1))
+            continue
+
+        if in_dep:
+            curr_indent = len(s) - len(s.lstrip())
+            if curr_indent <= dep_indent and not s.strip().startswith('-'):
+                in_dep = False
+            else:
+                dm_list = re.match(r'^\s+-\s*([a-zA-Z0-9_\-]+)', s)
+                dm_map = re.match(r'^\s+([a-zA-Z0-9_\-]+):\s*$', s)
+                dep_target = None
+                if dm_list:
+                    dep_target = dm_list.group(1)
+                elif dm_map:
+                    dep_target = dm_map.group(1)
+
+                if dep_target and dep_target not in ('condition', 'service_healthy', 'service_started', 'environment', 'logging', 'ports', 'image', 'restart', 'build'):
+                    if dep_target not in svcs[cur]['depends']:
+                        svcs[cur]['depends'].append(dep_target)
+    return svcs
+
+_ENV_LINK_KEY_RE = re.compile(r'HOST|URL|URI|UPSTREAM|BROKERS?|SERVERS?|ADDR|ENDPOINT', re.IGNORECASE)
+
+def _env_links(svc_name, env, all_names):
+    """(target, env_key, port) triples for env values that point at another compose service by hostname.
+    port is the number following 'svc:' in the value, or None."""
+    links = []
+    for key, val in (env or {}).items():
+        if not val: continue
+        for other in all_names:
+            if other == svc_name: continue
+            tok = re.escape(other)
+            port = None
+            pm = re.search(rf'(?<![\w.-]){tok}:(\d+)', val)                        # svc:port
+            host_ref = pm or (re.search(rf'//{tok}(?![\w-])', val)                # scheme://svc
+                              or re.search(rf'@{tok}(?![\w-])', val))              # user:pw@svc
+            if pm: port = int(pm.group(1))
+            if not host_ref and _ENV_LINK_KEY_RE.search(key):
+                host_ref = re.search(rf'(?<![\w.-]){tok}(?![\w-])', val)           # MAIL_HOST=svc
+            if host_ref:
+                links.append((other, key, port))
+                break
+    return links
+
+_COMPOSE_NAME_RE = re.compile(r'^(?:docker-)?compose(?:[.\-][\w.\-]+)?\.ya?ml$')
+_COMPOSE_SKIP_DIRS = {'node_modules', 'build', 'target', 'dist', '.git', '.gradle', '.idea', 'docs', 'test', 'tests', 'src'}
+
+def _find_compose_files(root, depth=2):
+    """Compose files at the root or up to `depth` folders down (deployment/, docker/, infra/ …).
+
+    Root files first; then sub-folders in name order. Override files
+    (docker-compose.override.yml, compose.prod.yaml …) come after their base file."""
+    found = []
+    def _visit(d, level):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        base_first = sorted((n for n in names if _COMPOSE_NAME_RE.match(n)),
+                            key=lambda n: (n.count('.') > 1, n))
+        found.extend(os.path.join(d, n) for n in base_first)
+        if level >= depth: return
+        for n in names:
+            if n.startswith('.') or n in _COMPOSE_SKIP_DIRS: continue
+            sub = os.path.join(d, n)
+            if os.path.isdir(sub): _visit(sub, level + 1)
+    _visit(root, 0)
+    return found
+
+def _load_compose(path):
+    svcs = {}
+    if _yaml is not None:
+        try:
+            svcs = _parse_compose_yaml(path)
+        except Exception as ex:
+            print(f"[arch-wiki] WARN: PyYAML could not parse {os.path.basename(path)} ({ex}); using line parser")
+            svcs = {}
+    if not svcs:
+        svcs = _parse_compose_lines(open(path, encoding='utf-8', errors='ignore').read().splitlines())
+    return svcs
+
 def _scan_docker(root):
-    for name in ['docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml']:
-        path = os.path.join(root, name)
-        if not os.path.isfile(path): continue
-        lines = open(path, encoding='utf-8', errors='ignore').read().splitlines()
-        svcs, cur = {}, None
-        in_svc, in_dep = False, False
-        dep_indent = 0
-
-        for ln in lines:
-            s = ln.rstrip()
-            if not s or s.startswith('#'): continue
-
-            if re.match(r'^[a-zA-Z0-9_\-]+:', s):
-                in_svc = s.startswith('services:')
-                cur = None; in_dep = False
-                continue
-            if not in_svc: continue
-
-            m = re.match(r'^  ([a-zA-Z0-9_\-]+):\s*$', s)
-            if m:
-                cur = m.group(1)
-                svcs[cur] = {'image':'','ports':[],'depends':[],'build':''}
-                in_dep = False; continue
-            if not cur: continue
-
-            if re.match(r'^\s+image:\s+', s): svcs[cur]['image'] = s.split('image:')[1].strip()
-            if re.match(r'^\s+context:\s+', s): svcs[cur]['build'] = s.split('context:')[1].strip()
-            pm = re.match(r'^\s+-\s*["\']?(\d+):(\d+)["\']?', s)
-            if pm: svcs[cur]['ports'].append(int(pm.group(1)))
-
-            dm_start = re.match(r'^(\s+)depends_on:', s)
-            if dm_start:
-                in_dep = True
-                dep_indent = len(dm_start.group(1))
-                continue
-
-            if in_dep:
-                curr_indent = len(s) - len(s.lstrip())
-                if curr_indent <= dep_indent and not s.strip().startswith('-'):
-                    in_dep = False
-                else:
-                    dm_list = re.match(r'^\s+-\s*([a-zA-Z0-9_\-]+)', s)
-                    dm_map = re.match(r'^\s+([a-zA-Z0-9_\-]+):\s*$', s)
-                    dep_target = None
-                    if dm_list:
-                        dep_target = dm_list.group(1)
-                    elif dm_map:
-                        dep_target = dm_map.group(1)
-                    
-                    if dep_target and dep_target not in ('condition', 'service_healthy', 'service_started', 'environment', 'logging', 'ports', 'image', 'restart', 'build'):
-                        if dep_target not in svcs[cur]['depends']:
-                            svcs[cur]['depends'].append(dep_target)
+    files = _find_compose_files(root)
+    if files:
+        # Merge every compose file; the first definition of a service wins, later files only
+        # add services (override files typically tweak ports/env of existing ones).
+        svcs, sources = {}, []
+        for path in files:
+            part = _load_compose(path)
+            if not part: continue
+            rel = os.path.relpath(path, root).replace('\\', '/')
+            sources.append(rel)
+            for sn, sv in part.items():
+                if sn not in svcs:
+                    sv['source'] = rel
+                    svcs[sn] = sv
+        name = ', '.join(sources) if len(sources) > 1 else (sources[0] if sources else files[0])
 
         all_svcs = list(svcs.keys())
         for sn, sv in svcs.items():
@@ -225,31 +518,51 @@ def _scan_docker(root):
                 for db in [f"{prefix}-mongodb", f"{prefix}-db", f"{prefix}-postgres", f"{prefix}-mysql"]:
                     if db in svcs and db not in sv['depends']:
                         sv['depends'].append(db)
-            
+
             if sn == 'gateway':
                 for target_svc in all_svcs:
                     if target_svc.endswith('-service') and target_svc not in sv['depends']:
                         sv['depends'].append(target_svc)
 
-        hints = {'postgres':'database','mysql':'database','mongo':'database','redis':'cache',
-                 'rabbitmq':'queue','kafka':'queue','nginx':'proxy','gateway':'proxy','traefik':'proxy',
-                 'prometheus':'monitoring','grafana':'monitoring','monitoring':'monitoring',
-                 'elasticsearch':'logging','registry':'registry','config':'config',
-                 'minio':'storage','s3':'storage','blob':'storage'}
         infra, nodes, edges = [], [], []
+        edge_by_pair = {}
         for sn, sv in svcs.items():
-            t = next((v for k,v in hints.items() if k in sn.lower() or k in sv['image'].lower()), 'app')
+            t = _infer_service_type(sn, sv['image'])
             port = sv['ports'][0] if sv['ports'] else None
-            infra.append({'id':sn,'name':sn.replace('-',' ').replace('_',' ').title(),'type':t,
+            optional = bool(sv.get('profiles'))
+            desc = f"{sn} container"
+            if optional:
+                desc += f" (profile: {', '.join(sv['profiles'])} — optional)"
+            entry = {'id':sn,'name':sn.replace('-',' ').replace('_',' ').title(),'type':t,
                 'image':sv['image'] or f"build:{sv['build']}",
-                'port':port,'description':f"{sn} container",'features':[]})
-            nodes.append({'id':sn,'label':f"{sn}{':%d'%port if port else ''}",
-                'type':t,'port':port})
+                'port':port,'description':desc,'features':[]}
+            if len(sources) > 1 and sv.get('source'):
+                entry['source'] = sv['source']
+            node = {'id':sn,'label':f"{sn}{':%d'%port if port else ''}",'type':t,'port':port}
+            if optional:
+                entry['optional'] = True; entry['profiles'] = list(sv['profiles'])
+                node['optional'] = True
+            if len(sv['ports']) > 1:
+                entry['ports'] = list(sv['ports'])
+            infra.append(entry)
+            nodes.append(node)
             for dep in sv['depends']:
-                if dep in svcs: edges.append({'from':sn,'to':dep,'label':''})
-        return infra, {'description':f"Topology from {name}.","nodes":nodes,"edges":edges}
+                if dep in svcs and (sn, dep) not in edge_by_pair:
+                    edge_by_pair[(sn, dep)] = {'from':sn,'to':dep,'label':'','kind':'depends_on'}
+                    edges.append(edge_by_pair[(sn, dep)])
+            for target, key, port in _env_links(sn, sv.get('env'), all_svcs):
+                label = f"{key} :{port}" if port else key
+                existing = edge_by_pair.get((sn, target))
+                if existing:
+                    # depends_on already drew the arrow — the runtime link tells *why*, so prefer its label
+                    if not existing['label']:
+                        existing['label'] = label
+                        existing['env'] = key
+                else:
+                    edge_by_pair[(sn, target)] = {'from':sn,'to':target,'label':label,'kind':'env','env':key}
+                    edges.append(edge_by_pair[(sn, target)])
+        return infra, {'description':f"Topology from {name}. Solid arrows: depends_on; labelled arrows: runtime links found in environment values.","nodes":nodes,"edges":edges}
     return [], {'description':'','nodes':[],'edges':[]}
-
 def _infer_desc(method, path, mod):
     has_id = bool(re.search(r':[^/]+|\{[^}]+\}', path))
     segs = [p for p in path.split('/') if p and not p.startswith(':') and not p.startswith('{')]
@@ -458,6 +771,19 @@ def _scan_fastapi(root):
             })
     return modules
 
+def _gradle_includes(root):
+    """Sub-project names from settings.gradle(.kts): include("a", ":b") / include 'a', 'b' / include(":a:b")."""
+    for name in ['settings.gradle.kts', 'settings.gradle']:
+        txt = _read(os.path.join(root, name))
+        if not txt: continue
+        mods = []
+        for m in re.finditer(r'^\s*include\s*\(?\s*((?:["\'][^"\']+["\']\s*,?\s*)+)\)?', txt, re.MULTILINE):
+            for q in re.findall(r'["\']([^"\']+)["\']', m.group(1)):
+                q = q.strip(':').replace(':', '/')
+                if q and q not in mods: mods.append(q)
+        return mods
+    return []
+
 def _detect_arch_type(root, fw):
     """
     Determines whether the codebase architecture is:
@@ -465,14 +791,10 @@ def _detect_arch_type(root, fw):
       - 'modular_monolith': Multi-module repo (e.g. Maven pom.xml with <modules> or subfolder services without docker)
       - 'microservice': Multi-service project with docker-compose or microservices architecture
     """
-    # Check docker-compose first
-    for name in ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']:
-        if os.path.isfile(os.path.join(root, name)):
-            try:
-                txt = open(os.path.join(root, name), encoding='utf-8', errors='ignore').read()
-                if 'services:' in txt:
-                    return 'microservice'
-            except: pass
+    # Check docker-compose first (root or deployment/, docker/, infra/ … up to 2 levels deep)
+    for path in _find_compose_files(root):
+        if 'services:' in _read(path):
+            return 'microservice'
 
     # Check Maven pom.xml for <modules>
     pom_path = os.path.join(root, 'pom.xml')
@@ -483,14 +805,9 @@ def _detect_arch_type(root, fw):
                 return 'modular_monolith'
         except: pass
 
-    # Check Gradle build.gradle / settings.gradle
-    settings_gradle = os.path.join(root, 'settings.gradle')
-    if os.path.isfile(settings_gradle):
-        try:
-            txt = open(settings_gradle, encoding='utf-8', errors='ignore').read()
-            if 'include ' in txt or 'include(' in txt:
-                return 'modular_monolith'
-        except: pass
+    # Check Gradle settings.gradle / settings.gradle.kts for sub-project includes
+    if _gradle_includes(root):
+        return 'modular_monolith'
 
     # Check top-level directories for multiple src/main/java sub-projects
     subdirs_with_src = 0
@@ -528,6 +845,391 @@ def _scan_screens_java(root):
     return screens
 
 
+# ---------------------------------------------------------------------------
+# JAVA SOURCE HELPERS  (shared by the Spring route scanner and SQL extractor)
+# ---------------------------------------------------------------------------
+
+_JAVA_MODIFIERS = {'public', 'protected', 'private', 'static', 'final', 'abstract',
+                   'synchronized', 'native', 'default', 'strictfp', 'transient', 'volatile'}
+_JAVA_NOT_A_TYPE = _JAVA_MODIFIERS | {'return', 'new', 'throw', 'throws', 'else', 'if', 'while',
+                                      'for', 'switch', 'catch', 'try', 'do', 'case', 'super', 'this',
+                                      'instanceof', 'assert', 'yield', 'import', 'package'}
+
+def _java_lex(txt):
+    """Blank out comments (keeping offsets) and return (code, string_spans).
+
+    string_spans is a list of (start, end, value) for every "…" literal and
+    \"\"\"…\"\"\" text block, with value already unescaped / de-indented.
+
+    Limitation: Java translates \\uXXXX escapes *before* tokenising, so a
+    \\u0022 (") outside a literal would open a string for javac but not here.
+    Real code essentially never does this; the escapes inside literals are
+    kept verbatim, which is what the catalog wants to show anyway.
+    """
+    n = len(txt)
+    out = list(txt)
+    spans = []
+    i = 0
+    while i < n:
+        c = txt[i]
+        nxt = txt[i+1] if i + 1 < n else ''
+        if c == '/' and nxt == '/':
+            j = txt.find('\n', i)
+            j = n if j < 0 else j
+            for k in range(i, j): out[k] = ' '
+            i = j
+        elif c == '/' and nxt == '*':
+            j = txt.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != '\n': out[k] = ' '
+            i = j
+        elif c == '"' and txt.startswith('"""', i):
+            j = i + 3
+            while j < n:
+                if txt[j] == '\\': j += 2; continue
+                if txt.startswith('"""', j): break
+                j += 1
+            raw = txt[i+3:j]
+            spans.append((i, j + 3, _java_text_block(raw)))
+            i = j + 3
+        elif c == '"':
+            j = i + 1
+            while j < n and txt[j] != '"':
+                if txt[j] == '\\': j += 1
+                if txt[j] == '\n': break
+                j += 1
+            spans.append((i, j + 1, _java_unescape(txt[i+1:j])))
+            i = j + 1
+        elif c == "'":
+            j = i + 1
+            while j < n and txt[j] != "'" and txt[j] != '\n':
+                if txt[j] == '\\': j += 1
+                j += 1
+            i = j + 1
+        else:
+            i += 1
+    return ''.join(out), spans
+
+def _java_unescape(s):
+    return (s.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+             .replace("\\'", "'").replace('\\\\', '\\'))
+
+def _java_text_block(raw):
+    """Strip the incidental indentation of a Java text block (JEP 378)."""
+    lines = raw.split('\n')
+    if lines and not lines[0].strip(): lines = lines[1:]
+    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    closing = lines[-1] if lines and not lines[-1].strip() else None
+    if closing is not None: indents.append(len(closing))
+    ind = min(indents) if indents else 0
+    lines = [l[ind:].rstrip() for l in lines]
+    return _java_unescape('\n'.join(lines)).strip('\n')
+
+def _in_string(pos, spans):
+    return any(s <= pos < e for s, e, _ in spans)
+
+def _balanced(code, open_idx, spans, opener='(', closer=')'):
+    """Index just past the bracket matching code[open_idx], skipping string contents."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        if _in_string(i, spans):
+            i += 1; continue
+        ch = code[i]
+        if ch == opener: depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0: return i + 1
+        i += 1
+    return n
+
+def _split_top_level(s, with_offsets=False):
+    """Split on commas that are not nested in (), {}, [] or a string.
+
+    With with_offsets=True returns [(part, offset_of_part_in_s)].
+    """
+    parts, depth, cur, in_str, esc, start = [], 0, [], None, False, 0
+    for i, ch in enumerate(s):
+        if in_str:
+            cur.append(ch)
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == in_str: in_str = None
+            continue
+        if ch in '"\'': in_str = ch
+        elif ch in '({[': depth += 1
+        elif ch in ')}]': depth -= 1
+        elif ch == ',' and depth == 0:
+            parts.append((''.join(cur), start)); cur = []; start = i + 1; continue
+        cur.append(ch)
+    parts.append((''.join(cur), start))
+    out = []
+    for part, off in parts:
+        stripped = part.strip()
+        if not stripped: continue
+        out.append((stripped, off + (len(part) - len(part.lstrip()))))
+    return out if with_offsets else [p for p, _ in out]
+
+def _java_annotations(code, spans):
+    """Every annotation outside strings: dicts {name, args, kw, pos, start, end}.
+
+    kw maps attribute → raw expression; positional value stored under '' .
+    """
+    annos = []
+    for m in re.finditer(r'@([A-Za-z_][\w.]*)', code):
+        if _in_string(m.start(), spans): continue
+        name = m.group(1).split('.')[-1]
+        end = m.end()
+        args = ''
+        j = end
+        while j < len(code) and code[j] in ' \t': j += 1
+        if j < len(code) and code[j] == '(':
+            end = _balanced(code, j, spans)
+            args = code[j+1:end-1]
+        kw, pos, kw_span = {}, [], {}
+        args_off = j + 1 if args else end
+        for part, off in _split_top_level(args, with_offsets=True):
+            km = re.match(r'^([A-Za-z_]\w*)\s*=(?!=)\s*(.*)$', part, re.DOTALL)
+            if km:
+                kw[km.group(1)] = km.group(2).strip()
+                kw_span[km.group(1)] = (args_off + off + km.start(2), args_off + off + len(part))
+            else:
+                pos.append(part)
+                if not kw_span.get(''):
+                    kw_span[''] = (args_off + off, args_off + off + len(part))
+        if pos: kw[''] = pos[0]
+        annos.append({'name': name, 'args': args, 'kw': kw, 'pos': pos, 'kw_span': kw_span,
+                      'start': m.start(), 'end': end})
+    return annos
+
+def _anno_literal(anno, key, spans):
+    """Concatenated string-literal value of an annotation attribute, read from the lexer spans
+    so text blocks and escapes are handled. Returns None when the attribute is absent."""
+    if key not in anno['kw_span']: return None
+    a, b = anno['kw_span'][key]
+    parts = [v for s, e, v in spans if a <= s and e <= b]
+    return ''.join(parts) if parts else None
+
+def _split_plus_chain(expr):
+    """Split `a + "b" + C.D` on the `+` operators that sit outside string literals."""
+    terms, cur, in_str, esc = [], [], False, False
+    for ch in expr:
+        if in_str:
+            cur.append(ch)
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == '"': in_str = False
+            continue
+        if ch == '"': in_str = True; cur.append(ch)
+        elif ch == '+': terms.append(''.join(cur)); cur = []
+        else: cur.append(ch)
+    terms.append(''.join(cur))
+    return [t for t in terms if t.strip()]
+
+def _string_values(expr, consts=None):
+    """String literals inside an annotation attribute value.
+
+    Handles "a", {"a", "b"}, "a" + "b" chains and simple constant references
+    resolved through `consts` (NAME or Class.NAME → value).
+    """
+    if expr is None: return []
+    expr = expr.strip()
+    if expr.startswith('{') and expr.endswith('}'):
+        return [v for part in _split_top_level(expr[1:-1]) for v in _string_values(part, consts)]
+    # evaluate a `+` chain term by term: every term must be a literal or a known constant
+    terms = _split_plus_chain(expr)
+    out, unresolved = [], False
+    for term in terms:
+        term = term.strip()
+        lit = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', term)
+        if lit:
+            out.append(_java_unescape(lit.group(1))); continue
+        key = term.replace(' ', '')
+        if consts and key in consts:
+            out.append(consts[key]); continue
+        if consts and key.split('.')[-1] in consts and re.fullmatch(r'[\w.]+', key):
+            out.append(consts[key.split('.')[-1]]); continue
+        unresolved = True
+    if out and not unresolved:
+        return [''.join(out)]
+    lits = re.findall(r'"((?:[^"\\]|\\.)*)"', expr)
+    return [_java_unescape(''.join(lits))] if lits else []
+
+def _java_string_consts(code):
+    """NAME → value for `static final String NAME = "…"` fields (and "a" + "b" chains)."""
+    consts = {}
+    for m in re.finditer(r'\bString\s+([A-Z_][A-Z0-9_]*)\s*=\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);', code):
+        consts[m.group(1)] = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)))
+    return consts
+
+_PROJECT_CONSTS_CACHE = {}
+
+def _java_project_consts(root):
+    """`Class.NAME` → value for every `static final String` constant in the tree, plus bare `NAME`
+    when it is unambiguous across classes. Built once per root; used to resolve cross-file
+    references such as AppConstants.ORDERS_TOPIC in mappings, @KafkaListener topics and sends."""
+    cached = _PROJECT_CONSTS_CACHE.get(root)
+    if cached is not None:
+        return cached
+    by_class, bare = {}, {}
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', '.gradle', '.idea', 'test')]
+        for f in fls:
+            if not f.endswith('.java'): continue
+            txt = _read(os.path.join(r, f))
+            if 'static final String' not in txt and 'final static String' not in txt: continue
+            code, _ = _java_lex(txt)
+            for k, v in _java_string_consts(code).items():
+                by_class[f"{f[:-5]}.{k}"] = v
+                bare.setdefault(k, set()).add(v)
+    for k, vals in bare.items():
+        if len(vals) == 1:
+            by_class.setdefault(k, next(iter(vals)))
+    _PROJECT_CONSTS_CACHE[root] = by_class
+    return by_class
+
+def _java_file_consts(code, root):
+    """Constants visible in one file: its own fields, `Class.NAME` project-wide, and names pulled
+    in with `import static …Class.NAME;` / `import static …Class.*;`."""
+    consts = dict(_java_project_consts(root))
+    for m in re.finditer(r'^\s*import\s+static\s+[\w.]*?\.(\w+)\.(\w+|\*)\s*;', code, re.MULTILINE):
+        cls, name = m.group(1), m.group(2)
+        if name == '*':
+            for k, v in _java_project_consts(root).items():
+                if k.startswith(cls + '.'): consts[k.split('.', 1)[1]] = v
+        elif f"{cls}.{name}" in consts:
+            consts[name] = consts[f"{cls}.{name}"]
+    consts.update(_java_string_consts(code))            # same-file definitions win
+    return consts
+
+_JAVA_METHOD_RE = re.compile(
+    r'(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)*'
+    r'(?:<[^>]*>\s*)?'                                   # generic method type params
+    r'([A-Za-z_][\w.]*(?:\s*<[^;{}()]*?>)?(?:\s*\[\s*\])*)'  # return type
+    r'\s+([A-Za-z_]\w*)\s*\(', re.DOTALL)
+
+def _java_method_after(code, pos, spans, limit=None):
+    """Name of the first method declared at or after `pos`, or None."""
+    limit = len(code) if limit is None else limit
+    for m in _JAVA_METHOD_RE.finditer(code, pos, limit):
+        if _in_string(m.start(), spans): continue
+        rtype, name = m.group(1).strip(), m.group(2)
+        if rtype.split('<')[0].split('.')[-1] in _JAVA_NOT_A_TYPE or name in _JAVA_NOT_A_TYPE: continue
+        if rtype in ('return',): continue
+        return name
+    return None
+
+def _java_methods(code, spans):
+    """[(start, name)] of every method/constructor-like declaration, in file order."""
+    out = []
+    for m in _JAVA_METHOD_RE.finditer(code):
+        if _in_string(m.start(), spans): continue
+        rtype, name = m.group(1).strip(), m.group(2)
+        head = rtype.split('<')[0].split('.')[-1]
+        if head in _JAVA_NOT_A_TYPE or name in _JAVA_NOT_A_TYPE: continue
+        # must be followed (after the parameter list) by '{', ';' or 'throws' — else it's a call
+        close = _balanced(code, m.end() - 1, spans)
+        tail = code[close:close+40].lstrip()
+        if not (tail.startswith('{') or tail.startswith(';') or tail.startswith('throws')): continue
+        out.append((m.start(), name))
+    return out
+
+def _java_type_name(code, spans):
+    """(name, decl_index) of the first top-level class/interface/record/enum."""
+    for m in re.finditer(r'\b(class|interface|record|enum)\s+([A-Za-z_]\w*)', code):
+        if not _in_string(m.start(), spans):
+            return m.group(2), m.start()
+    return None, len(code)
+
+def _join_path(base, sub):
+    full = '/' + '/'.join(p for p in (base or '').split('/') + (sub or '').split('/') if p)
+    return full
+
+def _common_path_prefix(paths):
+    segs = [[p for p in path.split('/') if p] for path in paths if path is not None]
+    if not segs: return '/'
+    prefix = segs[0]
+    for s in segs[1:]:
+        i = 0
+        while i < min(len(prefix), len(s)) and prefix[i] == s[i]: i += 1
+        prefix = prefix[:i]
+    return '/' + '/'.join(prefix)
+
+_SPRING_MAPPINGS = {'GetMapping': ['GET'], 'PostMapping': ['POST'], 'PutMapping': ['PUT'],
+                    'DeleteMapping': ['DELETE'], 'PatchMapping': ['PATCH'], 'RequestMapping': None}
+
+def _mapping_paths(anno, consts):
+    for key in ('', 'value', 'path'):
+        vals = _string_values(anno['kw'].get(key), consts)
+        if vals: return vals
+    return ['']
+
+def _mapping_methods(anno):
+    fixed = _SPRING_MAPPINGS.get(anno['name'])
+    if fixed: return fixed
+    found = re.findall(r'RequestMethod\.([A-Z]+)', anno['kw'].get('method', ''))
+    return found or ['GET']
+
+def _get_perm(annos):
+    for a in annos:
+        if a['name'] == 'PreAuthorize':
+            vals = _string_values(a['kw'].get('') or a['kw'].get('value'))
+            if vals: return vals[0]
+    for a in annos:
+        if a['name'] in ('RolesAllowed', 'Secured'):
+            vals = _string_values(a['kw'].get('') or a['kw'].get('value'))
+            if vals: return ' | '.join(vals)
+    return None
+
+_SPEL_ROLE_CALLS = {'hasRole': 'ROLE_', 'hasAnyRole': 'ROLE_', 'hasAuthority': '', 'hasAnyAuthority': ''}
+
+def _normalize_spel(expr):
+    """Turn a Spring Security SpEL expression into catalog-friendly fields.
+
+    Returns {'permission': 'a.view | b.edit' or None, 'objectLevel': bool, 'auth': True/False/None}.
+      hasAuthority('x')              → x
+      hasAnyAuthority('a', 'b')      → a | b
+      hasRole('ADMIN')               → ROLE_ADMIN
+      isAuthenticated()              → permission None, auth True
+      permitAll() / isAnonymous()    → permission None, auth False
+      hasPermission(...), @bean.m(...), #param references → objectLevel True
+    An expression that is only an object-level bean call keeps `bean.method` as its slug.
+    """
+    res = {'permission': None, 'objectLevel': False, 'auth': None}
+    if not expr:
+        return res
+    slugs = []
+    for m in re.finditer(r'\b(hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\(([^)]*)\)', expr):
+        prefix = _SPEL_ROLE_CALLS[m.group(1)]
+        for lit in re.findall(r"['\"]([^'\"]+)['\"]", m.group(2)):
+            slug = lit if (not prefix or lit.startswith(prefix)) else prefix + lit
+            if slug not in slugs: slugs.append(slug)
+    bean_calls = re.findall(r'@(\w+)\.(\w+)\s*\(', expr)
+    object_level = bool(bean_calls) or bool(re.search(r'\bhasPermission\s*\(', expr)) or '#' in expr
+    if not slugs and bean_calls:
+        slugs = [f"{b}.{mth}" for b, mth in bean_calls]
+    if not slugs and re.search(r'\bhasPermission\s*\(', expr):
+        slugs = ['hasPermission']
+    if re.search(r'\bdenyAll\s*\(', expr):
+        slugs = ['denied'] + slugs
+    res['permission'] = ' | '.join(slugs) if slugs else None
+    res['objectLevel'] = object_level
+    if slugs or re.search(r'\bis(?:Fully)?Authenticated\s*\(|\bhasPermission\s*\(', expr):
+        res['auth'] = True
+    elif re.search(r'\b(?:permitAll|isAnonymous)\s*\(', expr):
+        res['auth'] = False
+    return res
+
+def _get_summary(annos):
+    for a in annos:
+        if a['name'] == 'Operation':
+            for key in ('summary', 'description'):
+                vals = _string_values(a['kw'].get(key))
+                if vals and vals[0].strip(): return vals[0].strip()
+    return None
+
 def _scan_java_spring(root, arch_type=None):
     if not arch_type:
         arch_type = _detect_arch_type(root, 'spring')
@@ -541,16 +1243,19 @@ def _scan_java_spring(root, arch_type=None):
         for f in fls:
             if f.endswith('.java'):
                 files.append(os.path.join(r, f))
-
     mod_map = {}
     for rf in sorted(files):
         txt = open(rf, encoding='utf-8', errors='ignore').read()
         if not ('@RestController' in txt or '@Controller' in txt):
             continue
+        code, spans = _java_lex(txt)
+        annos = _java_annotations(code, spans)
+        if not any(a['name'] in ('RestController', 'Controller') for a in annos):
+            continue
 
         fn = os.path.basename(rf)
         raw_name = fn.replace('Controller.java', '').replace('.java', '')
-        
+
         rel = os.path.relpath(rf, root).replace('\\', '/')
         top_folder = rel.split('/')[0] if '/' in rel else raw_name.lower()
         is_monolith = (arch_type == 'monolith') or (top_folder in ('src', 'main', 'java', 'app', 'backend', 'server', '.'))
@@ -561,93 +1266,65 @@ def _scan_java_spring(root, arch_type=None):
         else:
             mid = top_folder
             svc_title = mid.replace('-service', '').replace('_service', '').replace('-', ' ').title()
-
         name = svc_title
 
-        bp_match = re.search(r'public\s+class\s+\w+[\s\S]*', txt)
-        header_part = txt[:bp_match.start()] if bp_match else txt
-        bp_m = re.search(r'@RequestMapping\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']+)["\']', header_part)
+        # Constants usable in mapping paths: this file, `Other.CONST` anywhere in the tree, static imports
+        consts = _java_file_consts(code, root)
 
-        if is_monolith:
-            base_path = bp_m.group(1) if bp_m else f"/{raw_name.lower()}"
-        else:
-            base_path = bp_m.group(1) if bp_m else (f"/{raw_name.lower()}" if mid != top_folder else f"/{top_folder.replace('-service','')}")
+        class_name, class_pos = _java_type_name(code, spans)
+        class_annos = [a for a in annos if a['start'] < class_pos]
+        member_annos = [a for a in annos if a['start'] >= class_pos]
 
-        if not base_path.startswith('/'):
-            base_path = '/' + base_path
+        class_bases = ['']
+        for a in class_annos:
+            if a['name'] == 'RequestMapping':
+                class_bases = _mapping_paths(a, consts)
+                break
+        class_perm = _get_perm(class_annos)
+        tag_desc = None
+        for a in class_annos:
+            if a['name'] == 'Tag':
+                vals = _string_values(a['kw'].get('description'))
+                if vals: tag_desc = vals[0].strip()
+        file_auth = ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt
+                     or 'RolesAllowed' in txt or 'Secured' in txt or 'Authentication' in txt)
 
-        eps = []
-        seen = set()
+        # Group member annotations into runs: consecutive annotations separated only by whitespace
+        runs, cur = [], []
+        for a in member_annos:
+            if cur and code[cur[-1]['end']:a['start']].strip():
+                runs.append(cur); cur = []
+            cur.append(a)
+        if cur: runs.append(cur)
 
-        def _get_perm(snip):
-            pm = re.search(r'@PreAuthorize\s*\(\s*"([^"]+)"\s*\)', snip) or re.search(r"@PreAuthorize\s*\(\s*'([^']+)'\s*\)", snip)
-            return pm.group(1) if pm else None
-
-        mapping_pats = [
-            ('GET', r'@GetMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('POST', r'@PostMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('PUT', r'@PutMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('DELETE', r'@DeleteMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-            ('PATCH', r'@PatchMapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?["\']([^"\']*)["\']\s*\))?'),
-        ]
-
-        for method, pat in mapping_pats:
-            for m in re.finditer(pat, txt):
-                ep_path = m.group(1) if (m.lastindex and m.group(1)) else '/'
-                if not ep_path:
-                    ep_path = '/'
-                
-                start_idx = max(0, m.start() - 250)
-                snippet = txt[start_idx:m.start()]
-                perm = _get_perm(snippet)
-                
-                key_ep = f"{method}:{ep_path}"
-                if key_ep not in seen:
-                    seen.add(key_ep)
-                    eps.append({
-                        'method': method,
-                        'path': ep_path,
-                        'auth': ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt or 'RolesAllowed' in txt),
-                        'permission': perm,
-                        'description': _infer_desc(method, ep_path, name)
-                    })
-
-        for m in re.finditer(r'(@PreAuthorize\s*\([^)]+\)\s*|@RolesAllowed\s*\([^)]+\)\s*)?@RequestMapping\s*\(([^)]+)\)', txt):
-            full_anno = m.group(0)
-            pre_auth = m.group(1)
-            params = m.group(2)
-            
-            if bp_match and m.start() < bp_match.start():
-                continue
-
-            meth_match = re.search(r'method\s*=\s*RequestMethod\.([A-Z]+)', params)
-            method = meth_match.group(1) if meth_match else 'GET'
-
-            path_match = re.search(r'(?:path|value)\s*=\s*["\']([^"\']*)["\']', params)
-            if not path_match:
-                path_match = re.search(r'["\']([^"\']*)["\']', params)
-            ep_path = path_match.group(1) if path_match else '/'
-            if not ep_path:
-                ep_path = '/'
-
-            perm = None
-            if pre_auth:
-                perm = _get_perm(pre_auth)
-            if not perm:
-                start_idx = max(0, m.start() - 250)
-                snippet = txt[start_idx:m.start()]
-                perm = _get_perm(snippet)
-
-            key_ep = f"{method}:{ep_path}"
-            if key_ep not in seen:
-                seen.add(key_ep)
-                eps.append({
-                    'method': method,
-                    'path': ep_path,
-                    'auth': ('Security' in txt or 'PreAuthorize' in txt or 'Principal' in txt or 'OAuth' in txt or 'RolesAllowed' in txt or perm is not None),
-                    'permission': perm,
-                    'description': _infer_desc(method, ep_path, name)
-                })
+        eps, seen = [], set()
+        for run in runs:
+            mappings = [a for a in run if a['name'] in _SPRING_MAPPINGS]
+            if not mappings: continue
+            perm = _get_perm(run) or class_perm
+            summary = _get_summary(run)
+            handler = _java_method_after(code, run[-1]['end'], spans)
+            for mp in mappings:
+                for method in _mapping_methods(mp):
+                    for base in class_bases:
+                        for sub in _mapping_paths(mp, consts):
+                            full = _join_path(base, sub)
+                            key_ep = f"{method}:{full}"
+                            if key_ep in seen: continue
+                            seen.add(key_ep)
+                            norm = _normalize_spel(perm)
+                            ep = {
+                                'method': method,
+                                'path': full,          # re-relativised against the module basePath below
+                                'auth': (norm['auth'] if norm['auth'] is not None else file_auth),
+                                'permission': norm['permission'],
+                                'description': summary or _infer_desc(method, sub or '/', name),
+                                'handler': f"{class_name or raw_name}.{handler}" if handler else None,
+                            }
+                            if perm:
+                                ep['permissionExpression'] = perm
+                                ep['objectLevel'] = norm['objectLevel']
+                            eps.append(ep)
 
         # Find matching screens/templates for this module
         mod_screens = []
@@ -658,30 +1335,52 @@ def _scan_java_spring(root, arch_type=None):
             if raw_low in sn or raw_low in sp or mid in sp:
                 mod_screens.append(scr['path'])
 
-        if eps or True:
-            perms = list(set(e['permission'] for e in eps if e.get('permission')))
-            if mid in mod_map:
-                if rel not in mod_map[mid]['files'] and fn not in mod_map[mid]['files']:
-                    mod_map[mid]['files'].append(rel)
-                mod_map[mid]['endpoints'].extend(eps)
-                mod_map[mid]['permissions'] = list(set(mod_map[mid]['permissions'] + perms))
-                for ms in mod_screens:
-                    if ms not in mod_map[mid]['files']:
-                        mod_map[mid]['files'].append(ms)
-                mod_map[mid]['description'] = f"{mod_map[mid]['name']} — {len(mod_map[mid]['endpoints'])} endpoint(s)"
-            else:
-                files_list = [rel] + mod_screens
-                mod_map[mid] = {
-                    'id': mid,
-                    'name': name if is_monolith else f"{svc_title} Service",
-                    'basePath': base_path,
-                    'description': f"{svc_title} module — {len(eps)} endpoint(s)" if is_monolith else f"{svc_title} microservice — {len(eps)} endpoint(s)",
-                    'color': _color(mid, len(mod_map)),
-                    'icon': _icon(mid),
-                    'files': files_list,
-                    'permissions': perms,
-                    'endpoints': eps
-                }
+        perms = list(set(e['permission'] for e in eps if e.get('permission')))
+        if mid in mod_map:
+            m = mod_map[mid]
+            if rel not in m['files'] and fn not in m['files']:
+                m['files'].append(rel)
+            existing = set(f"{e['method']}:{e['path']}" for e in m['endpoints'])
+            m['endpoints'].extend(e for e in eps if f"{e['method']}:{e['path']}" not in existing)
+            m['permissions'] = list(set(m['permissions'] + perms))
+            m['_bases'].extend(class_bases)
+            for ms in mod_screens:
+                if ms not in m['files']:
+                    m['files'].append(ms)
+            if tag_desc and not m.get('_tagDesc'):
+                m['_tagDesc'] = tag_desc
+        else:
+            mod_map[mid] = {
+                'id': mid,
+                'name': name if is_monolith else f"{svc_title} Service",
+                'basePath': '/',
+                'description': '',
+                'color': _color(mid, len(mod_map)),
+                'icon': _icon(mid),
+                'files': [rel] + mod_screens,
+                'permissions': perms,
+                'endpoints': eps,
+                '_bases': list(class_bases),
+                '_tagDesc': tag_desc,
+                '_monolith': is_monolith,
+                '_title': svc_title,
+            }
+
+    # Module basePath = longest common prefix of its controllers' class-level paths,
+    # endpoint paths relative to it — so basePath + path is always the real route.
+    for m in mod_map.values():
+        bp = _common_path_prefix([_join_path(b, '') for b in m.pop('_bases')])
+        m['basePath'] = bp
+        for e in m['endpoints']:
+            rel_path = e['path'][len(bp):] if bp != '/' and e['path'].startswith(bp) else e['path']
+            e['path'] = rel_path or '/'
+        n = len(m['endpoints'])
+        tag_desc = m.pop('_tagDesc', None)
+        title = m.pop('_title')
+        if m.pop('_monolith'):
+            m['description'] = f"{tag_desc or title + ' module'} — {n} endpoint(s)"
+        else:
+            m['description'] = f"{tag_desc or title + ' microservice'} — {n} endpoint(s)"
 
     if arch_type != 'monolith':
         pom_path = os.path.join(root, 'pom.xml')
@@ -708,6 +1407,310 @@ def _scan_java_spring(root, arch_type=None):
 
     return list(mod_map.values())
 
+# ---------------------------------------------------------------------------
+# SQL EXTRACTOR (Java)
+# Real queries from the source tree instead of per-endpoint placeholders:
+#   • @Query / @NativeQuery / @NamedQuery / @NamedNativeQuery (JPQL vs native)
+#   • string literals, text blocks and "…" + "…" chains that start with
+#     SELECT / INSERT / UPDATE / DELETE / WITH / MERGE (JdbcTemplate, EntityManager…)
+# Each query is attributed to its enclosing class + method; tables come from
+# FROM / JOIN / INTO / UPDATE. Endpoints are left empty rather than guessed.
+# ---------------------------------------------------------------------------
+
+_SQL_START_RE = re.compile(r'^\s*\(?\s*(SELECT|INSERT|UPDATE|DELETE|WITH|MERGE)\b', re.IGNORECASE)
+_SQL_SHAPE = {  # a statement must also carry the clause that makes it SQL, not prose
+    'SELECT': r'\bFROM\b|^\s*\(?\s*SELECT\s+(?:\d|[\w.]+\s*\(|\*)',
+    'INSERT': r'\bINTO\b', 'UPDATE': r'\bSET\b', 'DELETE': r'\bFROM\b',
+    'WITH': r'\bAS\s*\(', 'MERGE': r'\bINTO\b',
+}
+
+def _looks_like_sql(text):
+    m = _SQL_START_RE.match(text)
+    return bool(m) and bool(re.search(_SQL_SHAPE[m.group(1).upper()], text, re.IGNORECASE | re.DOTALL))
+_SQL_QUERY_ANNOS = {'Query': 'jpql', 'NativeQuery': 'native', 'NamedQuery': 'jpql', 'NamedNativeQuery': 'native'}
+
+def _sql_tables(sql, jpql=False):
+    """Table (or JPQL entity) names referenced after FROM / JOIN / INTO / UPDATE."""
+    s = re.sub(r"'(?:[^']|'')*'", "''", sql)                                   # drop string literals
+    s = re.sub(r'\b(?:EXTRACT|SUBSTRING|TRIM|POSITION|OVERLAY)\s*\([^()]*\)', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bFOR\s+(?:UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b(?:\s+OF\s+[\w.,\s]+?)?(?:\s+(?:SKIP\s+LOCKED|NOWAIT))?',
+               ' ', s, flags=re.IGNORECASE)                                     # row-lock clause is not a table
+    # CTE names (WITH a AS (...), b AS (...)) are not tables either
+    ctes = set()
+    # `\bWITH name AS (` opens the chain; `, name AS (` continues it (no \b: the comma follows a ')')
+    for wm in re.finditer(r'(?:\bWITH(?:\s+RECURSIVE)?|,)\s*([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s+AS\s*\(', s, re.IGNORECASE):
+        ctes.add(wm.group(1).lower())
+    tables = []
+    pat = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+(?:ONLY\s+|LATERAL\s+|FETCH\s+)?(?!SELECT\b|\(|VALUES\b|FETCH\b)'
+                     r'([`"\[]?[A-Za-z_][\w$]*[`"\]]?(?:\.[`"\[]?[A-Za-z_][\w$]*[`"\]]?)*)', re.IGNORECASE)
+    for m in pat.finditer(s):
+        t = re.sub(r'[`"\[\]]', '', m.group(1))
+        if jpql and '.' in t: continue                                          # i.customer path expressions
+        if t.lower() in ctes: continue
+        if t.upper() in ('DUAL', 'SET', 'WHERE', 'SELECT', 'UNNEST', 'GENERATE_SERIES', 'JSON_TABLE'): continue
+        if t not in tables: tables.append(t)
+    return tables
+
+def _java_brace_depths(code, spans):
+    """Brace depth before each character (strings ignored). Cheap enough: one pass per file."""
+    depths = [0] * (len(code) + 1)
+    d = 0
+    for i, ch in enumerate(code):
+        depths[i] = d
+        if _in_string(i, spans): continue
+        if ch == '{': d += 1
+        elif ch == '}': d -= 1
+    depths[len(code)] = d
+    return depths
+
+def _sql_module_for(rel, modules):
+    """Best-effort module name for a Java file: directory of a module file, top folder, or package."""
+    for m in modules or []:
+        for f in m.get('files', []):
+            d = os.path.dirname(f)
+            if d and rel.startswith(d + '/'): return m['name']
+    top = rel.split('/')[0]
+    for m in modules or []:
+        if m['id'] == top: return m['name']
+    pkg = re.search(r'/(?:java|kotlin)/(.+)/[^/]+\.java$', '/' + rel)
+    if pkg:
+        segs = pkg.group(1).split('/')
+        for seg in reversed(segs):
+            for m in modules or []:
+                if m['id'] == seg.lower(): return m['name']
+        return segs[-1].replace('_', ' ').title()
+    return ''
+
+def _scan_sql_java(root, modules=None):
+    queries = []
+    seen = set()
+    for r, _, fls in os.walk(root):
+        norm_r = r.replace('\\', '/')
+        if any(x in norm_r for x in ['/target/', '/.idea/', '/build/', '/.git/', '/test/', '/node_modules/']):
+            continue
+        for f in sorted(fls):
+            if not f.endswith('.java'): continue
+            rf = os.path.join(r, f)
+            txt = open(rf, encoding='utf-8', errors='ignore').read()
+            if not re.search(r'@(?:Native|Named)?(?:Native)?Query\b|\b(?:SELECT|INSERT|UPDATE|DELETE|WITH|MERGE)\b', txt, re.IGNORECASE):
+                continue
+            rel = os.path.relpath(rf, root).replace('\\', '/')
+            code, spans = _java_lex(txt)
+            if not spans: continue
+            class_name, _ = _java_type_name(code, spans)
+            class_name = class_name or f[:-5]
+            methods = _java_methods(code, spans)
+            depths = _java_brace_depths(code, spans)
+            module = _sql_module_for(rel, modules)
+            consumed = []
+
+            def _add(sql, kind, function, extra_purpose):
+                sql = sql.strip()
+                if not sql: return
+                key = (rel, function, sql)
+                if key in seen: return
+                seen.add(key)
+                tables = _sql_tables(sql, jpql=(kind == 'jpql'))
+                verb = re.match(r'\s*\(?\s*(\w+)', sql).group(1).upper()
+                target = tables[0] if tables else class_name
+                queries.append({
+                    'label': f"{verb} {target}",
+                    'module': module,
+                    'function': function,
+                    'purpose': extra_purpose,
+                    'file': rel,
+                    'queryType': kind,
+                    'tables': tables,
+                    'endpoints': [],
+                    'sql': sql,
+                })
+
+            # 1. @Query-family annotations → the method declared right after them
+            for a in _java_annotations(code, spans):
+                if a['name'] not in _SQL_QUERY_ANNOS: continue
+                consumed.append((a['start'], a['end']))
+                kind = _SQL_QUERY_ANNOS[a['name']]
+                native_attr = a['kw'].get('nativeQuery', '').strip().lower()
+                if native_attr == 'true': kind = 'native'
+                sql = None
+                for key in ('', 'value', 'query'):
+                    sql = _anno_literal(a, key, spans)
+                    if sql: break
+                if not sql: continue
+                meth = next((n for s, n in methods if s >= a['end']), None)
+                function = f"{class_name}.{meth}()" if meth else class_name
+                purpose = ("Native SQL declared with @Query(nativeQuery = true)" if kind == 'native'
+                           else "JPQL query declared with @Query")
+                if a['name'] in ('NamedQuery', 'NamedNativeQuery'):
+                    nm = _anno_literal(a, 'name', spans) or ''
+                    function = f"{class_name}@{nm}" if nm else class_name
+                    purpose = f"{'Native' if kind == 'native' else 'JPQL'} named query on entity {class_name}"
+                _add(sql, kind, function, purpose)
+
+            # 2. Free-standing literal chains that look like SQL
+            chains, cur = [], []
+            for sp in sorted(spans):
+                if any(cs <= sp[0] < ce for cs, ce in consumed): continue
+                if cur and re.fullmatch(r'\s*\+\s*', code[cur[-1][1]:sp[0]]):
+                    cur.append(sp)
+                else:
+                    if cur: chains.append(cur)
+                    cur = [sp]
+            if cur: chains.append(cur)
+            for ch in chains:
+                sql = ''.join(v for _, _, v in ch)
+                if not _looks_like_sql(sql): continue
+                start = ch[0][0]
+                before = code[max(0, start - 120):start]
+                if re.search(r'createNativeQuery\s*\(\s*$', before): kind = 'native'
+                elif re.search(r'createQuery\s*\(\s*$', before): kind = 'jpql'
+                else: kind = 'sql'
+                if depths[start] <= 1:
+                    fm = re.search(r'String\s+([A-Za-z_]\w*)\s*=\s*$', before)
+                    function = f"{class_name}.{fm.group(1)}" if fm else class_name
+                    purpose = "SQL constant declared as a class field"
+                else:
+                    meth = next((n for s, n in reversed(methods) if s < start), None)
+                    function = f"{class_name}.{meth}()" if meth else class_name
+                    purpose = {'native': "Native SQL passed to EntityManager.createNativeQuery",
+                               'jpql': "JPQL passed to EntityManager.createQuery"}.get(
+                               kind, "SQL string literal executed from application code")
+                _add(sql, kind, function, purpose)
+    return queries
+
+# ---------------------------------------------------------------------------
+# MESSAGING (Java) — @KafkaListener / @RabbitListener / @JmsListener / @SqsListener
+# consumers and KafkaTemplate / RabbitTemplate / JmsTemplate producers.
+# ---------------------------------------------------------------------------
+
+_LISTENER_ANNOS = {'KafkaListener': ('kafka', ('topics', 'topicPattern', '')),
+                   'RabbitListener': ('rabbitmq', ('queues', 'bindings', '')),
+                   'JmsListener': ('jms', ('destination', '')),
+                   'SqsListener': ('sqs', ('value', 'queueNames', ''))}
+
+def _scan_messaging_java(root):
+    listeners, producers = [], []
+    for r, _, fls in os.walk(root):
+        norm_r = r.replace('\\', '/')
+        if any(x in norm_r for x in ['/target/', '/.idea/', '/build/', '/.git/', '/test/', '/node_modules/']):
+            continue
+        for f in sorted(fls):
+            if not f.endswith('.java'): continue
+            rf = os.path.join(r, f)
+            txt = open(rf, encoding='utf-8', errors='ignore').read()
+            if not re.search(r'@(?:Kafka|Rabbit|Jms|Sqs)Listener|(?:kafka|rabbit|jms)Template|KafkaTemplate|RabbitTemplate|JmsTemplate', txt):
+                continue
+            rel = os.path.relpath(rf, root).replace('\\', '/')
+            code, spans = _java_lex(txt)
+            consts = _java_file_consts(code, root)
+            class_name, _ = _java_type_name(code, spans)
+            class_name = class_name or f[:-5]
+            methods = _java_methods(code, spans)
+            for a in _java_annotations(code, spans):
+                if a['name'] not in _LISTENER_ANNOS: continue
+                broker, keys = _LISTENER_ANNOS[a['name']]
+                topics = []
+                for k in keys:
+                    topics = _string_values(a['kw'].get(k), consts)
+                    if topics: break
+                if not topics and a['kw'].get('topics'):
+                    topics = [a['kw']['topics']]                      # unresolved constant — keep the reference
+                meth = next((n for st, n in methods if st >= a['end']), None)
+                entry = {'broker': broker, 'topics': topics,
+                         'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel}
+                gid = _string_values(a['kw'].get('groupId'), consts)
+                if gid: entry['groupId'] = gid[0]
+                listeners.append(entry)
+            # Producer handles: any field/variable typed KafkaTemplate / RabbitTemplate / JmsTemplate,
+            # plus the conventional *kafkaTemplate / *rabbitTemplate / *jmsTemplate names.
+            handles = {}
+            for fm in re.finditer(r'\b(Kafka|Rabbit|Jms)Template\s*(?:<[^;{}()]*>)?\s+([A-Za-z_]\w*)\s*[;=,)]', code):
+                handles[fm.group(2)] = {'Kafka': 'kafka', 'Rabbit': 'rabbitmq', 'Jms': 'jms'}[fm.group(1)]
+            for m in re.finditer(r'\b([A-Za-z_]\w*)\s*\.\s*(send|convertAndSend|sendDefault|executeInTransaction)\s*\(', code):
+                if _in_string(m.start(), spans): continue
+                var = m.group(1)
+                lv = var.lower()
+                broker = handles.get(var) or ('kafka' if 'kafkatemplate' in lv else ('rabbitmq' if 'rabbittemplate' in lv else ('jms' if 'jmstemplate' in lv else None)))
+                if not broker: continue
+                end = _balanced(code, m.end() - 1, spans)
+                args = _split_top_level(code[m.end():end - 1])
+                meth = next((n for st, n in reversed(methods) if st < m.start()), None)
+                entry = {'broker': broker, 'topic': None,
+                         'handler': f"{class_name}.{meth}()" if meth else class_name, 'file': rel}
+                if m.group(2) == 'executeInTransaction' or not args:
+                    entry.update({'dynamic': True, 'expression': args[0].strip() if args else ''})
+                    producers.append(entry); continue
+                # rabbit convertAndSend(exchange, routingKey, payload) → "exchange/routingKey"
+                topic_args = args[:2] if (broker == 'rabbitmq' and len(args) >= 3) else args[:1]
+                names, unresolved = [], False
+                for ta in topic_args:
+                    v = _string_values(ta, consts)
+                    if v: names.append(v[0])
+                    else: unresolved = True; names.append(ta.strip())
+                if unresolved:
+                    # send(record) / send(topicVar, payload) — topic decided at runtime (outbox pattern etc.)
+                    entry.update({'dynamic': True, 'expression': '/'.join(names)})
+                else:
+                    entry['topic'] = '/'.join(names)
+                producers.append(entry)
+    return {'listeners': listeners, 'producers': producers}
+
+def _js_package_type(pkg, rel):
+    deps = {}
+    for k in ('dependencies', 'devDependencies', 'peerDependencies'):
+        deps.update(pkg.get(k) or {})
+    name = (pkg.get('name') or rel).lower()
+    if any(d in deps for d in ('react-native', 'expo', '@capacitor/core', '@ionic/core')): return 'mobile'
+    if any(d in deps for d in ('express', '@nestjs/core', 'fastify', 'koa', 'hapi', '@hapi/hapi')): return 'backend'
+    if any(d in deps for d in ('react', 'react-dom', 'vue', '@angular/core', 'svelte', 'next', 'nuxt', 'vite', '@remix-run/react', 'solid-js')): return 'frontend'
+    if any(k in name or k in rel.lower() for k in ('web', 'admin', 'ui', 'frontend', 'console', 'portal', 'dashboard')): return 'frontend'
+    if any(k in name or k in rel.lower() for k in ('mobile', 'ios', 'android')): return 'mobile'
+    if any(k in name or k in rel.lower() for k in ('api', 'server', 'backend', 'service')): return 'backend'
+    return 'package'
+
+def _scan_js_packages(root):
+    """Sub-packages with their own package.json: workspaces globs, pnpm-workspace.yaml, and a
+    depth-2 scan (frontend/admin/package.json, mobile-sdk/ios/package.json …)."""
+    globs = []
+    root_pkg = {}
+    try:
+        root_pkg = json.load(open(os.path.join(root, 'package.json'), encoding='utf-8'))
+    except Exception:
+        pass
+    wsp = root_pkg.get('workspaces')
+    if isinstance(wsp, dict): wsp = wsp.get('packages')
+    if isinstance(wsp, list): globs += [str(g) for g in wsp]
+    pnpm = _read(os.path.join(root, 'pnpm-workspace.yaml'))
+    globs += re.findall(r'^\s*-\s*["\']?([^"\'#\n]+?)["\']?\s*$', pnpm, re.MULTILINE)
+    globs += ['*', '*/*']
+    found = {}
+    for g in globs:
+        for pkg_path in _glob.glob(os.path.join(root, g.rstrip('/'), 'package.json')):
+            rel = os.path.relpath(os.path.dirname(pkg_path), root).replace('\\', '/')
+            if rel in ('.', '') or '/node_modules' in '/' + rel or rel.startswith(('.', 'node_modules', 'dist', 'build', 'docs')):
+                continue
+            if rel in found: continue
+            try:
+                pkg = json.load(open(pkg_path, encoding='utf-8'))
+            except Exception:
+                pkg = {}
+            port = None
+            pm = re.search(r'^PORT\s*=\s*(\d+)', _read(os.path.join(root, rel, '.env')), re.MULTILINE)
+            if pm: port = int(pm.group(1))
+            entry = next((f"{rel}/{c}" for c in ('src/index.ts', 'src/main.ts', 'src/index.js', 'src/main.tsx', 'src/main.js', 'index.ts', 'index.js')
+                          if os.path.isfile(os.path.join(root, rel, c))), f"{rel}/package.json")
+            t = _js_package_type(pkg, rel)
+            found[rel] = {
+                'id': rel.replace('/', '-'),
+                'name': pkg.get('name') or rel,
+                'type': t,
+                'description': (pkg.get('description') or f"{os.path.basename(rel).replace('-', ' ').replace('_', ' ').title()} "
+                                + {'backend': 'REST API', 'frontend': 'UI', 'mobile': 'mobile app', 'package': 'package'}[t]),
+                'port': port,
+                'entrypoint': entry
+            }
+    return list(found.values())
+
 def _scan_workspaces(root):
     ws = []
     pom_path = os.path.join(root, 'pom.xml')
@@ -725,11 +1728,31 @@ def _scan_workspaces(root):
                 'port': port_base + idx,
                 'entrypoint': f"{sm_clean}/pom.xml"
             })
-        if ws: return ws
+
+    if not ws:
+        for gm in _gradle_includes(root):
+            bf = next((c for c in ['build.gradle.kts', 'build.gradle']
+                       if os.path.isfile(os.path.join(root, gm, c))), 'build.gradle.kts')
+            ws.append({
+                'id': gm.replace('/', '-'),
+                'name': gm,
+                'type': 'backend',
+                'description': f"{os.path.basename(gm).replace('-',' ').replace('_',' ').title()} Module",
+                'port': None,
+                'entrypoint': f"{gm}/{bf}"
+            })
+
+    # JS/TS packages (frontends, SDKs, admin consoles) live alongside Java modules in many repos
+    js_pkgs = _scan_js_packages(root)
+    known = {w['id'] for w in ws}
+    for pkg in js_pkgs:
+        if pkg['id'] not in known:
+            ws.append(pkg); known.add(pkg['id'])
 
     for sub in ['backend','frontend','api','web','mobile','admin']:
         p = os.path.join(root, sub)
-        if not os.path.isdir(p): continue
+        if not os.path.isdir(p) or sub in known: continue
+        if any(w['entrypoint'].startswith(sub + '/') for w in ws): continue   # its sub-packages were found
         t = 'backend' if sub in ('backend','api') else 'frontend'
         port = 3000 if t == 'backend' else 80
         env = os.path.join(p, '.env')
@@ -742,7 +1765,7 @@ def _scan_workspaces(root):
     return ws or [{'id':'api','name':'api','type':'backend',
         'description':'Main REST API','port':3000,'entrypoint':'src/index.ts'}]
 
-def _scan_core_layer(root, fw):
+def _scan_core_layer(root, fw, build_file=None):
     sec, mid, svc = [], [], []
 
     if fw in ('spring', 'java'):
@@ -772,7 +1795,7 @@ def _scan_core_layer(root, fw):
                     svc.append({"name": name_clean, "file": rel, "description": f"{stype} ({rel.split('/')[0]})", "exports": [name_clean]})
 
         if sec and not any(s['name'] == 'Spring Security & OAuth2' for s in sec):
-            sec.insert(0, {"name": "Spring Security & OAuth2", "file": "pom.xml", "description": "Framework OAuth2 Resource Server & JWT verification layer"})
+            sec.insert(0, {"name": "Spring Security & OAuth2", "file": build_file or "pom.xml", "description": "Framework OAuth2 Resource Server & JWT verification layer"})
 
     elif fw in ('express', 'nestjs', 'fastify'):
         pkg_path = os.path.join(root, 'package.json')
@@ -886,7 +1909,7 @@ def _build_sys_diagram(modules, infrastructure):
         
     data_nodes = []
     for s in infrastructure:
-        if s.get('type') in ('database', 'cache', 'queue', 'storage'):
+        if s.get('type') in ('database', 'cache', 'queue', 'storage', 'auth', 'mail', 'search'):
             data_nodes.append({'id': s['id'], 'label': f"{s['name']}{(' :%s'%s.get('port')) if s.get('port') else ''}", 'type': s.get('type')})
     if not data_nodes:
         data_nodes.append({'id': 'db', 'label': 'PostgreSQL Database', 'type': 'database'})
@@ -904,7 +1927,8 @@ def _build_sys_diagram(modules, infrastructure):
             
     for an in api_nodes:
         for dn in data_nodes:
-            lbl = 'Store / Fetch' if dn.get('type') == 'storage' else ('Cache / PubSub' if dn.get('type') == 'cache' else 'Query')
+            lbl = {'storage': 'Store / Fetch', 'cache': 'Cache / PubSub', 'queue': 'Publish / Consume',
+                   'auth': 'OIDC / JWT', 'mail': 'SMTP', 'search': 'Index / Search'}.get(dn.get('type'), 'Query')
             edges.append({'from': an['id'], 'to': dn['id'], 'label': lbl})
             
     return {'description': 'System architecture, module boundaries, and infrastructure component relationships.',
@@ -1030,8 +2054,156 @@ def _build_data_flow(fw, core_layer):
 # architecture.json INITIALISER — now powered by codebase scanner
 # ---------------------------------------------------------------------------
 
-def init_architecture(target_root=None):
-    """Scan the codebase and generate architecture.json automatically."""
+def build_permissions(modules):
+    """Permission catalog + slug→endpoint details derived from module endpoints.
+
+    Exposed for docs/architecture/arch_overrides.py hooks that change endpoint
+    permissions and want to rebuild the `permissions` section afterwards.
+    """
+    perm_details = []
+    for mod in modules:
+        for ep in mod.get('endpoints', []):
+            pslug = ep.get('permission')
+            full_ep_path = (mod['basePath'] + ("" if ep['path'] == "/" else ep['path'])).replace("//", "/")
+            ep_obj = {"method": ep['method'], "path": full_ep_path}
+
+            if pslug:
+                sub_slugs = [s.strip() for s in pslug.split('|') if s.strip()]
+            elif ep.get('auth', False):
+                sub_slugs = ['authenticated']
+            else:
+                sub_slugs = ['public']
+
+            if ep.get('objectLevel'):
+                ep_obj['objectLevel'] = True
+            for sub_slug in sub_slugs:
+                existing = next((d for d in perm_details if d['slug'] == sub_slug), None)
+                if existing:
+                    if ep_obj not in existing['endpoints']:
+                        existing['endpoints'].append(ep_obj)
+                else:
+                    action_type = "SYSTEM SCOPE" if sub_slug in ('authenticated', 'public') else "RBAC PERMISSION"
+                    page_label = "Public Access" if sub_slug == 'public' else ("Authenticated User Access" if sub_slug == 'authenticated' else f"{mod['name']} Management")
+                    existing = {
+                        "slug": sub_slug,
+                        "module": mod['name'],
+                        "action": action_type,
+                        "endpoints": [ep_obj],
+                        "adminPages": [page_label]
+                    }
+                    perm_details.append(existing)
+                if ep.get('objectLevel'):
+                    existing['objectLevel'] = True
+                if ep.get('permissionExpression'):
+                    exprs = existing.setdefault('expressions', [])
+                    if ep['permissionExpression'] not in exprs:
+                        exprs.append(ep['permissionExpression'])
+
+    all_perms = sorted(set(d['slug'] for d in perm_details))
+    return {
+        "description": "RBAC permission catalog and endpoint mapping.",
+        "catalog": all_perms,
+        "details": perm_details
+    }
+
+
+OVERRIDES_FILE = 'arch_overrides.py'
+
+def _apply_overrides(data, root, arch_dir):
+    """Run docs/architecture/arch_overrides.py if present: apply(data, root) -> data.
+
+    The hook receives the complete manifest after every scanner has run and
+    returns the manifest to write (returning None keeps `data`). It is the
+    place to merge a better source of truth — a permission catalog file, a
+    frontend API client that maps calls to pages, hand-written SQL/endpoint
+    links. Only swaggerSchemas.matchStatus is recomputed afterwards.
+    """
+    hook_path = os.path.join(arch_dir, OVERRIDES_FILE)
+    if not os.path.isfile(hook_path):
+        return data
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('arch_overrides', hook_path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        if not hasattr(mod, 'apply'):
+            print(f"[arch-wiki] WARN: {OVERRIDES_FILE} has no apply(data, root) function — ignored")
+            return data
+        result = mod.apply(data, root)
+    except Exception as ex:
+        print(f"[arch-wiki] ERROR in {hook_path}: {type(ex).__name__}: {ex}")
+        raise
+    if result is None:
+        result = data
+    total_ep = sum(len(m.get('endpoints', [])) for m in result.get('modules', []))
+    result.setdefault('swaggerSchemas', {})['matchStatus'] = f"Verified Parity ({total_ep}/{total_ep} Endpoints)"
+    print(f"[arch-wiki] Applied {OVERRIDES_FILE}: {len(result.get('modules', []))} module(s), {total_ep} endpoint(s), "
+          f"{len(result.get('permissions', {}).get('catalog', []))} permission(s), {len(result.get('sqlQueries', []))} SQL quer(y/ies)")
+    return result
+
+
+def _project_version(root, fw, default='1.0.0'):
+    """Project version, never None: VERSION file, then the build file for the framework
+    (Gradle `version = "x"`, the POM's own <version>, pyproject.toml), then package.json,
+    then `default`."""
+    v = _project_version_or_none(root, fw)
+    if v: return v
+    for pkg_loc in (os.path.join(root, 'package.json'), os.path.join(root, 'backend', 'package.json')):
+        try:
+            pv = json.load(open(pkg_loc, encoding='utf-8')).get('version')
+            if pv: return str(pv)
+        except Exception:
+            pass
+    return default
+
+def _project_version_or_none(root, fw):
+    for name in ('VERSION', 'VERSION.txt', 'version.txt'):
+        v = _read(os.path.join(root, name)).strip().splitlines()
+        if v and re.match(r'^v?\d[\w.\-+]*$', v[0].strip()):
+            return v[0].strip().lstrip('v')
+    if fw in ('spring', 'java'):
+        bf = _java_build_file(root)
+        if bf and os.path.basename(bf) == 'pom.xml':
+            txt = _read(bf)
+            body = re.sub(r'<parent>.*?</parent>', '', txt, flags=re.DOTALL)
+            m = re.search(r'<version>\s*([^<\s]+)\s*</version>', body)
+            if m: return m.group(1)
+        elif bf:
+            bdir = os.path.dirname(bf)
+            for cand in ('build.gradle.kts', 'build.gradle', 'gradle.properties'):
+                m = re.search(r'^\s*version\s*=\s*["\']?([^"\'\s]+)', _read(os.path.join(bdir, cand)), re.MULTILINE)
+                if m and m.group(1) not in ('unspecified',): return m.group(1)
+    elif fw in ('fastapi', 'django', 'flask'):
+        m = re.search(r'^\s*version\s*=\s*["\']([^"\']+)["\']', _read(os.path.join(root, 'pyproject.toml')), re.MULTILINE)
+        if m: return m.group(1)
+    return None
+
+
+def _system_endpoints(fw, java_info=None):
+    """Framework-level operational endpoints. Spring Boot with Actuator exposes /actuator/*;
+    everything else keeps the conventional /health."""
+    java_info = java_info or {}
+    if fw in ('spring', 'java') and java_info.get('actuator'):
+        base = (java_info.get('contextPath') or '') + '/actuator'
+        eps = [
+            {"method": "GET", "path": f"{base}/health", "auth": False, "description": "Spring Boot Actuator health check"},
+            {"method": "GET", "path": f"{base}/info", "auth": False, "description": "Spring Boot Actuator build / git info"},
+        ]
+        if java_info.get('prometheus'):
+            eps.append({"method": "GET", "path": f"{base}/prometheus", "auth": False,
+                        "description": "Micrometer Prometheus scrape endpoint"})
+        return eps
+    return [{"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}]
+
+
+def init_architecture(target_root=None, placeholder_sql=False, skip_overrides=False):
+    """Scan the codebase and generate architecture.json automatically.
+
+    placeholder_sql=True restores the legacy per-endpoint SQL placeholders for
+    Java projects instead of extracting real @Query / SQL literals.
+    skip_overrides=True ignores docs/architecture/arch_overrides.py (useful while
+    developing the hook or to compare raw scanner output).
+    """
     if not target_root:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         root = _find_root(script_dir)
@@ -1053,6 +2225,7 @@ def init_architecture(target_root=None):
                 if d.get('description'): proj_desc = d.get('description')
                 if proj_name and proj_desc: break
             except: pass
+    proj_version = _project_version(root, fw)
     if not proj_name or proj_name in ('arch-wiki', 'template'):
         proj_name = os.path.basename(root)
     if not proj_desc:
@@ -1068,6 +2241,14 @@ def init_architecture(target_root=None):
                'spring': {'language':'Java 17',   'framework':'Spring Boot'},
                'unknown':{'language':'TypeScript','framework':'Express.js'}}.get(fw,{'language':'TypeScript','framework':'Express.js'})
 
+    java_info = _java_build_info(root) if fw in ('spring', 'java') else {}
+    if java_info:
+        if java_info.get('javaVersion'):
+            fw_info = dict(fw_info, language=f"Java {java_info['javaVersion']}")
+        if java_info.get('springBootVersion'):
+            fw_info = dict(fw_info, framework=f"Spring Boot {java_info['springBootVersion']}")
+
+    _PROJECT_CONSTS_CACHE.pop(root, None)
     print(f"[arch-wiki] Root: {root} | Framework: {fw}")
 
     # 3. Scan docker-compose
@@ -1092,44 +2273,100 @@ def init_architecture(target_root=None):
     workspaces = _scan_workspaces(root)
 
     # 6. Collect all permission slugs & details
-    perm_details = []
-    for mod in modules:
-        for ep in mod.get('endpoints', []):
-            pslug = ep.get('permission')
-            full_ep_path = (mod['basePath'] + ("" if ep['path'] == "/" else ep['path'])).replace("//", "/")
-            ep_obj = {"method": ep['method'], "path": full_ep_path}
-
-            if pslug:
-                sub_slugs = [s.strip() for s in pslug.split('|') if s.strip()]
-            elif ep.get('auth', False):
-                sub_slugs = ['authenticated']
-            else:
-                sub_slugs = ['public']
-
-            for sub_slug in sub_slugs:
-                existing = next((d for d in perm_details if d['slug'] == sub_slug), None)
-                if existing:
-                    if ep_obj not in existing['endpoints']:
-                        existing['endpoints'].append(ep_obj)
-                else:
-                    action_type = "SYSTEM SCOPE" if sub_slug in ('authenticated', 'public') else "RBAC PERMISSION"
-                    page_label = "Public Access" if sub_slug == 'public' else ("Authenticated User Access" if sub_slug == 'authenticated' else f"{mod['name']} Management")
-                    perm_details.append({
-                        "slug": sub_slug,
-                        "module": mod['name'],
-                        "action": action_type,
-                        "endpoints": [ep_obj],
-                        "adminPages": [page_label]
-                    })
-
-    all_perms = sorted(set(d['slug'] for d in perm_details))
+    permissions = build_permissions(modules)
 
     # 7. System arch diagram
     sys_diag = _build_sys_diagram(modules, infrastructure)
 
     # 8. Core Layer & SQL Queries
-    core_layer = _scan_core_layer(root, fw)
+    core_layer = _scan_core_layer(root, fw, java_info.get('buildFile'))
+    messaging = _scan_messaging_java(root) if fw in ('spring', 'java') else {'listeners': [], 'producers': []}
+    if messaging['listeners'] or messaging['producers']:
+        print(f"[arch-wiki] Messaging: {len(messaging['listeners'])} listener(s), {len(messaging['producers'])} producer(s)")
 
+    if fw in ('spring', 'java') and not placeholder_sql:
+        sql_queries = _scan_sql_java(root, modules)
+        print(f"[arch-wiki] SQL: {len(sql_queries)} quer{'y' if len(sql_queries) == 1 else 'ies'} extracted from Java sources")
+    else:
+        sql_queries = _placeholder_sql(modules, fw)
+
+    db_name = next((s['image'].split(':')[0].split('/')[-1].title()
+                    for s in infrastructure if s['type']=='database'), 'PostgreSQL')
+
+    today = datetime.date.today().isoformat()
+    total_ep_str = f"{total_ep}/{total_ep}"
+
+    # API docs route / OpenAPI version / local server depend on the framework
+    if fw in ('spring', 'java'):
+        local_port = java_info.get('serverPort') or 8080
+        local_url = f"http://localhost:{local_port}{java_info.get('contextPath') or ''}"
+        if java_info.get('apiDocs') == 'springdoc':
+            swagger_meta = {'openapi': '3.1.0', 'servedAt': '/v3/api-docs', 'swaggerUi': '/swagger-ui.html'}
+        elif java_info.get('apiDocs') == 'springfox':
+            swagger_meta = {'openapi': '3.0.0', 'servedAt': '/v2/api-docs', 'swaggerUi': '/swagger-ui/'}
+        else:
+            swagger_meta = {'openapi': '3.0.0', 'servedAt': 'not detected (add springdoc-openapi)', 'swaggerUi': None}
+    else:  # Express / NestJS / FastAPI keep the historical defaults
+        local_url = 'http://localhost:3000'
+        swagger_meta = {'openapi': '3.0.0', 'servedAt': '/api/docs', 'swaggerUi': None}
+
+    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces, java_info)
+
+    scaffold = {
+        "meta": {
+            "displayName": display_name,
+            "version": proj_version,
+            "description": proj_desc or f"{display_name} REST API",
+            "generatedAt": today,
+            "techStack": {
+                "language": fw_info['language'],
+                "framework": fw_info['framework'],
+                "database": db_name,
+                "auth": "JWT / Bearer Token"
+            }
+        },
+        "prerequisites": prerequisites,
+        "workspaces": workspaces,
+        "infrastructure": infrastructure,
+        "dockerDiagram": docker_diagram,
+        "systemArchitectureDiagram": sys_diag,
+        "swaggerSchemas": {
+            "matchStatus": f"Verified Parity ({total_ep_str} Endpoints)",
+            "openapi": swagger_meta['openapi'],
+            "servedAt": swagger_meta['servedAt'],
+            "swaggerUi": swagger_meta['swaggerUi'],
+            "securityScheme": "bearerAuth (JWT Bearer Token)",
+            "servers": [
+                {"url": local_url, "description": "Local Development Server"},
+                {"url": f"https://api.{display_name.lower().replace(' ','-')}.com", "description": "Production"}
+            ],
+            "schemas": []
+        },
+        "modules": modules,
+        "systemEndpoints": _system_endpoints(fw, java_info),
+        "coreLayer": core_layer,
+        "dataFlow": _build_data_flow(fw, core_layer),
+        "permissions": permissions,
+        "sqlQueries": sql_queries,
+        "messaging": messaging
+    }
+
+    if skip_overrides:
+        if os.path.isfile(os.path.join(arch_dir, OVERRIDES_FILE)):
+            print(f"[arch-wiki] Skipping {OVERRIDES_FILE} (--skip-overrides)")
+    else:
+        scaffold = _apply_overrides(scaffold, root, arch_dir)
+
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(scaffold, f, indent=2)
+
+    print(f"[arch-wiki] Generated architecture.json -> {json_path}")
+    return scaffold
+
+
+def _placeholder_sql(modules, fw):
+    """Legacy catalog: one templated statement per endpoint (tables are guessed from the
+    module id / last path segment). Kept for non-Java frameworks and --placeholder-sql."""
     sql_queries = []
     for mod in modules:
         mname = mod['name']
@@ -1213,66 +2450,12 @@ def init_architecture(target_root=None):
                 "sql": sql_stmt
             })
 
-    db_name = next((s['image'].split(':')[0].split('/')[-1].title()
-                    for s in infrastructure if s['type']=='database'), 'PostgreSQL')
-
-    today = datetime.date.today().isoformat()
-    total_ep_str = f"{total_ep}/{total_ep}"
-
-    prerequisites = _scan_prerequisites(root, fw, infrastructure, workspaces)
-
-    scaffold = {
-        "meta": {
-            "displayName": display_name,
-            "version": "1.0.0",
-            "description": proj_desc or f"{display_name} REST API",
-            "generatedAt": today,
-            "techStack": {
-                "language": fw_info['language'],
-                "framework": fw_info['framework'],
-                "database": db_name,
-                "auth": "JWT / Bearer Token"
-            }
-        },
-        "prerequisites": prerequisites,
-        "workspaces": workspaces,
-        "infrastructure": infrastructure,
-        "dockerDiagram": docker_diagram,
-        "systemArchitectureDiagram": sys_diag,
-        "swaggerSchemas": {
-            "matchStatus": f"Verified Parity ({total_ep_str} Endpoints)",
-            "openapi": "3.0.0",
-            "servedAt": "/api/docs",
-            "securityScheme": "bearerAuth (JWT Bearer Token)",
-            "servers": [
-                {"url": "http://localhost:3000", "description": "Local Development Server"},
-                {"url": f"https://api.{display_name.lower().replace(' ','-')}.com", "description": "Production"}
-            ],
-            "schemas": []
-        },
-        "modules": modules,
-        "systemEndpoints": [
-            {"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}
-        ],
-        "coreLayer": core_layer,
-        "dataFlow": _build_data_flow(fw, core_layer),
-        "permissions": {
-            "description": "RBAC permission catalog and endpoint mapping.",
-            "catalog": all_perms,
-            "details": perm_details
-        },
-        "sqlQueries": sql_queries
-    }
-
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(scaffold, f, indent=2)
-
-    print(f"[arch-wiki] Generated architecture.json -> {json_path}")
-    return scaffold
+    return sql_queries
 
 
-def _scan_prerequisites(root, fw, infrastructure, workspaces):
+def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
     tools = []
+    java_info = java_info or {}
 
     # 1. Primary Runtime Engine
     if fw in ('express', 'nestjs', 'fastify'):
@@ -1286,7 +2469,7 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
     elif fw in ('spring', 'java'):
         tools.append({
             "name": "Java OpenJDK / JDK",
-            "version": ">= 17",
+            "version": f">= {java_info.get('javaVersion') or '17'}",
             "required": True,
             "category": "runtime",
             "description": "Java SE Development Kit required for Spring Boot backend compilation and execution."
@@ -1308,8 +2491,30 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
             "description": "JavaScript runtime environment."
         })
 
+    gradle = fw in ('spring', 'java') and java_info.get('buildTool') == 'gradle'
+    if fw in ('spring', 'java'):
+        if gradle:
+            wrapper = os.path.isfile(os.path.join(root, 'gradlew'))
+            tools.append({
+                "name": "Gradle" + (" (wrapper included)" if wrapper else ""),
+                "version": ">= 8.x" if not wrapper else "./gradlew",
+                "required": True,
+                "category": "build",
+                "description": f"Build tool declared in {java_info.get('buildFile') or 'build.gradle'}"
+                               + (" (Kotlin DSL)." if java_info.get('kotlinDsl') else ".")
+            })
+        else:
+            wrapper = os.path.isfile(os.path.join(root, 'mvnw'))
+            tools.append({
+                "name": "Maven" + (" (wrapper included)" if wrapper else ""),
+                "version": ">= 3.9" if not wrapper else "./mvnw",
+                "required": True,
+                "category": "build",
+                "description": "Build tool declared in pom.xml."
+            })
+
     # 2. Containerization / Infrastructure tools
-    has_compose = os.path.isfile(os.path.join(root, 'docker-compose.yml')) or os.path.isfile(os.path.join(root, 'docker-compose.yaml'))
+    has_compose = bool(_find_compose_files(root))
     if infrastructure or has_compose:
         tools.append({
             "name": "Docker & Docker Compose",
@@ -1325,11 +2530,11 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
         sname = s.get('name', 'Service')
         simg  = s.get('image', 'latest')
         sport = s.get('port')
-        if stype in ('database', 'cache', 'queue', 'monitoring'):
+        if stype in ('database', 'cache', 'queue', 'monitoring', 'auth', 'mail', 'search', 'storage'):
             tools.append({
                 "name": f"{sname} ({stype.title()})",
                 "version": simg,
-                "required": True if stype in ('database', 'cache') else False,
+                "required": stype in ('database', 'cache', 'auth') and not s.get('optional'),
                 "category": stype,
                 "description": f"Containerized {stype} service running on port {sport or 'internal'}."
             })
@@ -1390,9 +2595,10 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
     elif fw in ('spring', 'java'):
         setup_steps.append({
             "step": step_num,
-            "title": "Build Maven Modules",
-            "command": "./mvnw clean install -DskipTests",
-            "description": "Compile Java packages and download Maven dependencies."
+            "title": "Build Gradle Projects" if gradle else "Build Maven Modules",
+            "command": "./gradlew build -x test" if gradle else "./mvnw clean install -DskipTests",
+            "description": "Compile Java sources and resolve dependencies via the Gradle wrapper." if gradle
+                           else "Compile Java packages and download Maven dependencies."
         })
     elif fw in ('fastapi', 'django', 'flask'):
         setup_steps.append({
@@ -1404,19 +2610,44 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces):
     step_num += 1
 
     # Step 4: Database Migrations & Seeds
+    if fw in ('spring', 'java'):
+        mig = java_info.get('migrations')
+        plugin = java_info.get('migrationPlugin')
+        if mig == 'flyway' and plugin:
+            mig_cmd = "./gradlew flywayMigrate" if gradle else "./mvnw flyway:migrate"
+            mig_desc = "Apply Flyway migrations via the build plugin (they also run at application start)."
+        elif mig == 'liquibase' and plugin:
+            mig_cmd = "./gradlew update" if gradle else "./mvnw liquibase:update"
+            mig_desc = "Apply Liquibase changelogs via the build plugin (they also run at application start)."
+        elif mig:
+            mig_cmd = "# migrations run automatically at application start"
+            mig_desc = f"{mig.title()} is on the classpath without a build plugin — migrations apply when the app boots."
+        else:
+            mig_cmd = "# no Flyway/Liquibase detected — schema managed by JPA (spring.jpa.hibernate.ddl-auto)"
+            mig_desc = "No migration tool detected — schema is managed by JPA/Hibernate at application start."
+    elif fw in ('express', 'nestjs'):
+        mig_cmd, mig_desc = "npm run db:migrate && npm run db:seed", "Execute database schema migrations and populate initial seed records."
+    else:
+        mig_cmd, mig_desc = "alembic upgrade head", "Execute database schema migrations and populate initial seed records."
     setup_steps.append({
         "step": step_num,
         "title": "Run Schema Migrations & Database Seeds",
-        "command": "npm run db:migrate && npm run db:seed" if fw in ('express', 'nestjs') else ("./mvnw compile exec:java" if fw == 'spring' else "alembic upgrade head"),
-        "description": "Execute database schema migrations and populate initial seed records."
+        "command": mig_cmd,
+        "description": mig_desc
     })
     step_num += 1
 
     # Step 5: Boot Application Development Server
+    if fw in ('spring', 'java'):
+        run_cmd = "./gradlew bootRun" if gradle else "./mvnw spring-boot:run"
+    elif fw in ('express', 'nestjs'):
+        run_cmd = "npm run dev"
+    else:
+        run_cmd = "uvicorn main:app --reload"
     setup_steps.append({
         "step": step_num,
         "title": "Launch Development Server",
-        "command": "npm run dev" if fw in ('express', 'nestjs') else ("./mvnw spring-boot:run" if fw == 'spring' else "uvicorn main:app --reload"),
+        "command": run_cmd,
         "description": "Start backend API in watch mode."
     })
 
@@ -1443,6 +2674,14 @@ def clean_mermaid(text):
         return ""
     return re.sub(r'[^a-zA-Z0-9 _\-\.:]', '', str(text))
 
+_MERMAID_EXTRA_CLASSDEFS = """    classDef auth fill:#312e81,stroke:#a5b4fc,stroke-width:2px,color:#fff;
+    classDef mail fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#fff;
+    classDef voice fill:#4a044e,stroke:#e879f9,stroke-width:2px,color:#fff;
+    classDef storage fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#fff;
+    classDef search fill:#365314,stroke:#a3e635,stroke-width:2px,color:#fff;
+    classDef registry fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#fff;
+    classDef config fill:#3f3f46,stroke:#d4d4d8,stroke-width:2px,color:#fff;"""
+
 def build_openapi_spec(data):
     meta = data.get('meta', {})
     modules = data.get('modules', [])
@@ -1450,7 +2689,7 @@ def build_openapi_spec(data):
     swagger_schemas = data.get('swaggerSchemas', {})
 
     spec = {
-        "openapi": "3.0.0",
+        "openapi": swagger_schemas.get('openapi') or "3.0.0",
         "info": {
             "title": meta.get('displayName', 'SaaS MVP Platform API'),
             "version": meta.get('version', '1.0.0'),
@@ -1584,6 +2823,16 @@ def generate_html(data, target_dir=None):
 
     tech_stack = meta.get('techStack', {})
     total_endpoints = sum(len(m.get('endpoints', [])) for m in modules) + len(system_endpoints)
+    openapi_version = str(swagger_schemas.get('openapi') or '3.0.0')
+    openapi_short = '.'.join(openapi_version.split('.')[:2])
+    local_base_url = next((sv.get('url') for sv in swagger_schemas.get('servers', []) if sv.get('url')), 'http://localhost:3000')
+    messaging = data.get('messaging') or {}
+    msg_listeners = messaging.get('listeners', [])
+    msg_producers = messaging.get('producers', [])
+    _all_eps = [ep for m in modules for ep in m.get('endpoints', [])] + list(system_endpoints)
+    public_ep_count = sum(1 for ep in _all_eps if not ep.get('auth', False))
+    auth_ep_count = sum(1 for ep in _all_eps if ep.get('auth', False))
+    object_level_count = sum(1 for ep in _all_eps if ep.get('objectLevel'))
     prereq_tools = prerequisites.get('tools', [])
     prereq_steps = prerequisites.get('setupSteps', [])
 
@@ -2727,6 +3976,10 @@ def generate_html(data, target_dir=None):
                 <div class="nav-btn-left"><span>&#128452;</span> <span>SQL Queries</span></div>
                 <span class="nav-count">{len(sql_queries)}</span>
             </button>
+            {f'''<button class="nav-btn" onclick="showTab('messaging', this)">
+                <div class="nav-btn-left"><span>&#128227;</span> <span>Messaging</span></div>
+                <span class="nav-count">{len(msg_listeners) + len(msg_producers)}</span>
+            </button>''' if (msg_listeners or msg_producers) else ''}
             <button class="nav-btn" onclick="showTab('infra', this)">
                 <div class="nav-btn-left"><span>&#128187;</span> <span>Infrastructure</span></div>
                 <span class="nav-count">{len(infrastructure)}</span>
@@ -2740,7 +3993,7 @@ def generate_html(data, target_dir=None):
         </nav>
 
         <div class="sidebar-footer">
-           © AHMED EMAD - {html.escape(meta.get('displayName', 'Project MVP'))}
+           {html.escape(meta.get('displayName', 'Project'))} · generated by arch-wiki · {html.escape(meta.get('generatedAt', ''))}
         </div>
     </aside>
 
@@ -2901,7 +4154,9 @@ def generate_html(data, target_dir=None):
                 else:
                     full_path = raw_p if raw_p else '/'
 
-            perm_str = f'<span class="lock">🔒 {html.escape(ep["permission"])}</span>' if ep.get('permission') else ('<span class="lock">🔑</span>' if ep.get('auth') else '')
+            perm_str = f'<span class="lock" title="{html.escape(ep.get("permissionExpression") or "")}">🔒 {html.escape(ep["permission"])}</span>' if ep.get('permission') else ('<span class="lock">🔑</span>' if ep.get('auth') else '')
+            if ep.get('objectLevel'):
+                perm_str += f'<span class="lock" title="{html.escape(ep.get("permissionExpression") or "Object-level authorization check")}">🔎 object-level</span>'
             eps_html += f"""
                 <div class="endpoint clickable-ep" data-method="{m}" data-path="{html.escape(full_path)}" onclick="openApiPromptFromEl(this)" title="Click to view AI Senior Developer prompt">
                     <span class="method {m}">{m}</span>
@@ -2954,7 +4209,7 @@ flowchart TB
     classDef queue fill:#4c1d95,stroke:#8b5cf6,stroke-width:2px,color:#fff;
     classDef monitoring fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff;
     classDef logging fill:#831843,stroke:#ec4899,stroke-width:2px,color:#fff;
-
+{_MERMAID_EXTRA_CLASSDEFS}
 """
     sys_type_map = {}
     for sg in system_arch_diagram.get('subgraphs', []):
@@ -3034,7 +4289,7 @@ flowchart TD
     classDef monitoring fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff;
     classDef logging fill:#831843,stroke:#ec4899,stroke-width:2px,color:#fff;
     classDef uptime fill:#7f1d1d,stroke:#ef4444,stroke-width:2px,color:#fff;
-
+{_MERMAID_EXTRA_CLASSDEFS}
 """
         type_map = {}
         for node in docker_diagram.get('nodes', []):
@@ -3061,6 +4316,9 @@ flowchart TD
         for t_name, n_ids in type_map.items():
             if n_ids:
                 html_content += f"    class {','.join(n_ids)} {t_name};\n"
+        for node in docker_diagram.get('nodes', []):
+            if node.get('optional'):
+                html_content += f"    style {clean_mermaid(node['id'])} stroke-dasharray: 6 4\n"
 
         html_content += """
                 </script>
@@ -3078,7 +4336,7 @@ flowchart TD
             <div class="chead">
                 <span style="font-size:28px">&#9889;</span>
                 <div>
-                    <div class="card-title">Swagger & OpenAPI 3.0 API Specification & Explorer</div>
+                    <div class="card-title">Swagger & OpenAPI {html.escape(openapi_short)} API Specification & Explorer</div>
                     <div class="card-sub">Interactive REST API documentation generated from architecture manifest ({total_endpoints} Endpoints)</div>
                 </div>
                 <span class="badge badge-green" style="margin-left:auto; font-size: 12px; padding: 6px 12px;">STATUS: {html.escape(swagger_schemas.get('matchStatus', 'Verified Parity').upper())}</span>
@@ -3091,7 +4349,7 @@ flowchart TD
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Base URL</div>
-                    <code>http://localhost:3000</code>
+                    <code>{html.escape(local_base_url)}</code>
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Security Scheme</div>
@@ -3099,7 +4357,7 @@ flowchart TD
                 </div>
                 <div style="font-size: 12px; color: var(--muted);">
                     <div style="color: var(--text); font-weight: 600; margin-bottom: 2px;">Live Swagger Route</div>
-                    <code>{html.escape(swagger_schemas.get('servedAt', '/api/docs'))}</code>
+                    <code>{html.escape(swagger_schemas.get('servedAt') or '/api/docs')}</code>{f'<div style="margin-top:2px">UI: <code>{html.escape(swagger_schemas["swaggerUi"])}</code></div>' if swagger_schemas.get('swaggerUi') else ''}
                 </div>
             </div>
         </div>
@@ -3108,7 +4366,7 @@ flowchart TD
         <div style="display: flex; gap: 8px; margin-bottom: 16px;">
             <button class="sub-tab-btn active" onclick="switchSwaggerView('ui', this)">&#9889; Interactive Swagger UI</button>
             <button class="sub-tab-btn" onclick="switchSwaggerView('catalog', this)">&#128216; API Endpoint Catalog & cURL ({total_endpoints})</button>
-            <button class="sub-tab-btn" onclick="switchSwaggerView('json', this)">&#128220; OpenAPI 3.0 JSON Spec</button>
+            <button class="sub-tab-btn" onclick="switchSwaggerView('json', this)">&#128220; OpenAPI {html.escape(openapi_short)} JSON Spec</button>
         </div>
 
         <!-- Pane 1: Interactive Swagger UI -->
@@ -3154,16 +4412,16 @@ flowchart TD
             m_class = 'tg' if m == 'GET' else ('tb' if m == 'POST' else ('ty' if m in ['PUT','PATCH'] else 'tr'))
             curl_auth_header = ' -H "Authorization: Bearer $JWT_TOKEN"' if auth else ''
             curl_body = ' -H "Content-Type: application/json" -d \'{"key":"value"}\'' if m in ['POST','PUT','PATCH'] else ''
-            curl_cmd = f"curl -X {m} \"http://localhost:3000{full_path}\"{curl_auth_header}{curl_body}"
+            curl_cmd = f"curl -X {m} \"{local_base_url}{full_path}\"{curl_auth_header}{curl_body}"
 
             html_content += f"""
                     <div style="background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px;">
                         <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                             <span class="tag {m_class}" style="font-weight: 700; font-size: 11px;">{m}</span>
                             <span style="font-family: var(--font-code); font-weight: 600; font-size: 13px; color: var(--text);">{html.escape(full_path)}</span>
-                            {f'<span class="tag tb" style="font-size:10px; margin-left:auto;">&#128273; {html.escape(perm)}</span>' if perm else (
+                            {f'<span class="tag tb" style="font-size:10px; margin-left:auto;" title="{html.escape(ep.get("permissionExpression") or "")}">&#128273; {html.escape(perm)}</span>' if perm else (
                              '<span class="tag tg" style="font-size:10px; margin-left:auto;">&#128274; Authenticated</span>' if auth else '<span class="tag ty" style="font-size:10px; margin-left:auto;">&#127760; Public</span>'
-                            )}
+                            )}{f'<span class="tag tp" style="font-size:10px;" title="{html.escape(ep.get("permissionExpression") or "")}">&#128270; object-level</span>' if ep.get('objectLevel') else ''}
                         </div>
                         <div style="font-size: 12px; color: var(--muted); margin-top: 6px;">{html.escape(desc)}</div>
                         <div style="margin-top: 8px;">
@@ -3184,7 +4442,7 @@ flowchart TD
         <div id="swagger-view-json" class="swagger-view-pane">
             <div class="card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                    <div style="font-weight: 600; font-size: 14px;">OpenAPI 3.0.0 JSON Specification Source</div>
+                    <div style="font-weight: 600; font-size: 14px;">OpenAPI {html.escape(openapi_version)} JSON Specification Source</div>
                     <button class="sub-tab-btn" onclick="navigator.clipboard.writeText(document.getElementById('swaggerOpenApiJsonSrc').textContent); alert('Copied OpenAPI JSON Spec to clipboard!');">&#128203; Copy OpenAPI Spec</button>
                 </div>
                 <pre style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: var(--font-code); font-size: 12px; color: var(--text); max-height: 600px; overflow-y: auto;"><code id="swaggerOpenApiJsonSrc">{html.escape(openapi_spec_json)}</code></pre>
@@ -3201,8 +4459,9 @@ flowchart TD
 
         <div class="stats" style="margin-bottom: 20px;">
             <div class="stat"><div class="stat-num">{len(permissions.get('catalog', []))}</div><div class="stat-lbl">Security Scopes / Slugs</div></div>
-            <div class="stat"><div class="stat-num">{sum(len(d.get('endpoints', [])) for d in permissions.get('details', []) if d.get('slug') != 'public')}</div><div class="stat-lbl">Authenticated Endpoints</div></div>
-            <div class="stat"><div class="stat-num">{sum(len(d.get('endpoints', [])) for d in permissions.get('details', []) if d.get('slug') == 'public')}</div><div class="stat-lbl">Public Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{auth_ep_count}</div><div class="stat-lbl">Authenticated Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{public_ep_count}</div><div class="stat-lbl">Public Endpoints</div></div>
+            <div class="stat"><div class="stat-num">{object_level_count}</div><div class="stat-lbl">Object-Level Checks</div></div>
             <div class="stat"><div class="stat-num">{len(permissions.get('details', []))}</div><div class="stat-lbl">Mapped Scope Groups</div></div>
         </div>
 """
@@ -3235,6 +4494,11 @@ flowchart TD
                 eps_html += f'<span class="method {m}">{m}</span> <code style="font-size:12px">{html.escape(ep.get("path",""))}</code> &nbsp; '
 
             pages_html = ", ".join([f'<span class="tag tb">{html.escape(pg)}</span>' for pg in pdet.get('adminPages', [])])
+            if pdet.get('objectLevel'):
+                pages_html += ' <span class="tag tp" title="Some endpoints add an object-level check">&#128270; object-level</span>'
+            exprs_html = ""
+            if pdet.get('expressions'):
+                exprs_html = "".join(f'<div style="font-family:var(--font-code); font-size:11px; color:var(--muted); margin-top:4px;">{html.escape(x)}</div>' for x in pdet['expressions'])
             slug_val = pdet.get('slug', '')
             slug_icon = '🔑' if slug_val not in ('authenticated', 'public') else ('🔒' if slug_val == 'authenticated' else '🌐')
 
@@ -3250,6 +4514,7 @@ flowchart TD
                 <div style="margin-top: 6px; font-size: 12px; color: var(--muted);">
                     <strong>Scope Target:</strong> {pages_html}
                 </div>
+                {f'<div style="margin-top: 6px; font-size: 12px; color: var(--muted);"><strong>Raw expressions:</strong>{exprs_html}</div>' if exprs_html else ''}
             </div>
 """
         html_content += """
@@ -3258,11 +4523,11 @@ flowchart TD
     html_content += """
     </div>
 
-    <!-- 6. SQL QUERIES CATALOG -->
+    <!-- 6. SQL QUERIES CATALOG (rendered lazily from embedded JSON) -->
     <div class="section" id="sec-sql">
         <div class="sec-title">&#128452; SQL Query Catalog & Repository Mapping</div>
         <p style="font-size: 13px; color: var(--muted); margin-bottom: 16px;">
-            Raw SQL statements mapped to repository/service functions, affected tables, and API endpoints.
+            Raw SQL / JPQL statements mapped to repository functions, affected tables, and API endpoints.
         </p>
 """
     if not sql_queries:
@@ -3274,50 +4539,88 @@ flowchart TD
         </div>
 """
     else:
-        html_content += """
-        <div class="grid1">
-"""
-        for q in sql_queries:
-            eps_html = ""
-            for ep in q.get('endpoints', []):
-                m = ep.get('method', 'GET').upper()
-                eps_html += f'<span class="method {m}">{m}</span> <code style="font-size:12px">{html.escape(ep.get("path",""))}</code> &nbsp; '
-
-            tables_html = " ".join([f'<span class="tag tg">{html.escape(tb)}</span>' for tb in q.get('tables', [])])
-
-            html_content += f"""
-            <div class="card">
-                <div class="chead" style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
-                    <div class="card-title" style="color: var(--yellow);">&#9889; {html.escape(q.get('label', ''))}</div>
-                    <span class="tag tp" style="margin-left:auto">{html.escape(q.get('module', ''))} • {html.escape(q.get('function', ''))}</span>
-                </div>
-                <p style="font-size: 13px; color: var(--muted); margin: 6px 0;">
-                    <strong>Purpose:</strong> {html.escape(q.get('purpose', ''))}<br>
-                    <strong>File:</strong> <code>{html.escape(q.get('file', ''))}</code> | <strong>Tables:</strong> {tables_html}
-                </p>
-                <div style="margin: 8px 0; font-size: 12px;">
-                    <strong>Consuming Endpoints:</strong> {eps_html}
-                </div>
-                <div class="code-block">{html.escape(q.get('sql', ''))}</div>
-            </div>
-"""
-        html_content += """
+        sql_json = json.dumps(sql_queries, ensure_ascii=False).replace('</', '<\\/')
+        html_content += f"""
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+            <input id="sqlSearch" type="search" placeholder="Filter by table, function, file or SQL text…" oninput="sqlApplyFilter()"
+                   style="flex:1; min-width:240px; background:var(--bg2); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:13px;">
+            <span id="sqlCount" style="font-size:12px; color:var(--muted);"></span>
         </div>
+        <div class="grid1" id="sqlCatalogGrid"></div>
+        <div style="text-align:center; margin-top:16px;">
+            <button id="sqlMoreBtn" class="sub-tab-btn" onclick="sqlRenderMore()" style="display:none;">Load 50 more</button>
+        </div>
+        <script type="application/json" id="sqlCatalogData">{sql_json}</script>
 """
     html_content += """
     </div>
 
+    <!-- 6b. MESSAGING (only when listeners / producers were found) -->
+"""
+    if msg_listeners or msg_producers:
+        html_content += f"""
+    <div class="section" id="sec-messaging">
+        <div class="sec-title">&#128227; Messaging — Consumers &amp; Producers</div>
+        <p style="font-size: 13px; color: var(--muted); margin-bottom: 16px;">
+            Topics, queues and destinations discovered from @KafkaListener / @RabbitListener / @JmsListener and *Template.send() calls.
+        </p>
+        <div class="stats" style="margin-bottom: 20px;">
+            <div class="stat"><div class="stat-num">{len(msg_listeners)}</div><div class="stat-lbl">Listeners</div></div>
+            <div class="stat"><div class="stat-num">{len(msg_producers)}</div><div class="stat-lbl">Producers</div></div>
+            <div class="stat"><div class="stat-num">{len({t for l in msg_listeners for t in l.get('topics', [])} | {p.get('topic') for p in msg_producers if p.get('topic')})}</div><div class="stat-lbl">Topics / Queues</div></div>
+        </div>
+        <div class="sec-title" style="font-size:14px;">Consumers</div>
+        <div class="grid2">
+"""
+        for l in msg_listeners:
+            topics_html = "".join(f'<span class="tag ty">{html.escape(t)}</span>' for t in l.get('topics', [])) or '<span class="tag tq">(unresolved)</span>'
+            gid = f' · group <code>{html.escape(l["groupId"])}</code>' if l.get('groupId') else ''
+            html_content += f"""
+            <div class="card">
+                <div class="card-title">{html.escape(l.get('handler', ''))} <span class="tag tp">{html.escape(l.get('broker', ''))}</span></div>
+                <div class="card-sub" style="margin-bottom:8px;">{html.escape(l.get('file', ''))}{gid}</div>
+                <div>{topics_html}</div>
+            </div>
+"""
+        html_content += """
+        </div>
+        <div class="sec-title" style="font-size:14px; margin-top:20px;">Producers</div>
+        <div class="grid2">
+"""
+        for pr in msg_producers:
+            if pr.get('topic'):
+                topic_html = f'<span class="tag tg">{html.escape(pr["topic"])}</span>'
+            else:
+                topic_html = f'<span class="tag ty" title="Topic is decided at runtime">dynamic topic</span> <code style="font-size:11px">{html.escape(pr.get("expression", ""))}</code>'
+            html_content += f"""
+            <div class="card">
+                <div class="card-title">{html.escape(pr.get('handler', ''))} <span class="tag tp">{html.escape(pr.get('broker', ''))}</span></div>
+                <div class="card-sub" style="margin-bottom:8px;">{html.escape(pr.get('file', ''))}</div>
+                <div>{topic_html}</div>
+            </div>
+"""
+        if not msg_producers:
+            html_content += '            <div style="font-size:13px; color:var(--muted);">No producers detected.</div>\n'
+        html_content += """
+        </div>
+    </div>
+"""
+    html_content += """
     <!-- 7. INFRASTRUCTURE -->
     <div class="section" id="sec-infra">
         <div class="sec-title">&#128187; Infrastructure Services</div>
         <div class="grid3">
 """
-    tc_map = {'database':'tb', 'cache':'tg', 'queue':'ty', 'proxy':'tq', 'monitoring':'tp', 'logging':'tr', 'uptime':'tr'}
+    tc_map = {'database':'tb', 'cache':'tg', 'queue':'ty', 'proxy':'tq', 'monitoring':'tp', 'logging':'tr', 'uptime':'tr',
+              'auth':'tp', 'mail':'ty', 'voice':'tr', 'storage':'tb', 'search':'tg', 'registry':'tq', 'config':'tq'}
     for s in infrastructure:
         t_cls = tc_map.get(s.get('type'), 'tq')
-        ports = f" : {s.get('port')}" if s.get('port') else ""
+        all_ports = s.get('ports') or ([s.get('port')] if s.get('port') else [])
+        ports = f" : {', '.join(str(p) for p in all_ports)}" if all_ports else ""
         mgmt = f" (mgmt: {s.get('managementPort')})" if s.get('managementPort') else ""
         feats = "".join([f'<span class="tag tq">{html.escape(f)}</span>' for f in s.get('features', [])])
+        if s.get('optional'):
+            feats += f'<span class="tag ty" title="Only started with --profile">optional · profile: {html.escape(", ".join(s.get("profiles", [])))}</span>'
 
         html_content += f"""
             <div class="card">
@@ -3637,6 +4940,70 @@ flowchart TD
         }}
     }}
 
+    // ---- SQL catalog: rendered on first visit from the embedded JSON, 50 cards at a time ----
+    var SQL_PAGE = 50, sqlCatalog = null, sqlFiltered = [], sqlShown = 0;
+    function escHtml(v) {{
+        return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) {{
+            return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+        }});
+    }}
+    function sqlLoad() {{
+        if (sqlCatalog) return;
+        var el = document.getElementById('sqlCatalogData');
+        try {{ sqlCatalog = el ? JSON.parse(el.textContent) : []; }} catch (e) {{ console.error('SQL catalog JSON error', e); sqlCatalog = []; }}
+    }}
+    function sqlCard(q) {{
+        var eps = (q.endpoints || []).map(function(ep) {{
+            var m = (ep.method || 'GET').toUpperCase();
+            return '<span class="method ' + m + '">' + m + '</span> <code style="font-size:12px">' + escHtml(ep.path) + '</code> &nbsp; ';
+        }}).join('');
+        var tables = (q.tables || []).map(function(t) {{ return '<span class="tag tg">' + escHtml(t) + '</span>'; }}).join(' ');
+        var kind = q.queryType ? '<span class="tag ty" style="margin-left:6px">' + escHtml(q.queryType) + '</span>' : '';
+        return '<div class="card">' +
+            '<div class="chead" style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">' +
+                '<div class="card-title" style="color: var(--yellow);">&#9889; ' + escHtml(q.label) + kind + '</div>' +
+                '<span class="tag tp" style="margin-left:auto">' + escHtml(q.module) + (q.module && q.function ? ' • ' : '') + escHtml(q.function) + '</span>' +
+            '</div>' +
+            '<p style="font-size: 13px; color: var(--muted); margin: 6px 0;">' +
+                (q.purpose ? '<strong>Purpose:</strong> ' + escHtml(q.purpose) + '<br>' : '') +
+                '<strong>File:</strong> <code>' + escHtml(q.file) + '</code>' + (tables ? ' | <strong>Tables:</strong> ' + tables : '') +
+            '</p>' +
+            (eps ? '<div style="margin: 8px 0; font-size: 12px;"><strong>Consuming Endpoints:</strong> ' + eps + '</div>' : '') +
+            '<div class="code-block">' + escHtml(q.sql) + '</div>' +
+        '</div>';
+    }}
+    function sqlApplyFilter() {{
+        sqlLoad();
+        var q = ((document.getElementById('sqlSearch') || {{}}).value || '').toLowerCase();
+        sqlFiltered = !q ? sqlCatalog : sqlCatalog.filter(function(x) {{
+            return [x.label, x.module, x.function, x.file, (x.tables || []).join(' '), x.sql, x.queryType].join(' ').toLowerCase().indexOf(q) !== -1;
+        }});
+        var grid = document.getElementById('sqlCatalogGrid');
+        if (grid) grid.innerHTML = '';
+        sqlShown = 0;
+        sqlRenderMore();
+    }}
+    function sqlRenderMore(all) {{
+        var grid = document.getElementById('sqlCatalogGrid');
+        if (!grid) return;
+        var end = all ? sqlFiltered.length : Math.min(sqlFiltered.length, sqlShown + SQL_PAGE);
+        var buf = [];
+        for (var i = sqlShown; i < end; i++) buf.push(sqlCard(sqlFiltered[i]));
+        grid.insertAdjacentHTML('beforeend', buf.join(''));
+        sqlShown = end;
+        var more = document.getElementById('sqlMoreBtn');
+        if (more) more.style.display = sqlShown < sqlFiltered.length ? '' : 'none';
+        var count = document.getElementById('sqlCount');
+        if (count) count.textContent = 'Showing ' + sqlShown + ' of ' + sqlFiltered.length + (sqlCatalog && sqlFiltered.length !== sqlCatalog.length ? ' (filtered from ' + sqlCatalog.length + ')' : '');
+    }}
+    function renderSqlCatalog(all) {{
+        sqlLoad();
+        if (sqlShown === 0 || all) {{
+            if (all) {{ var g = document.getElementById('sqlCatalogGrid'); if (g) g.innerHTML = ''; sqlShown = 0; sqlFiltered = sqlCatalog; sqlRenderMore(true); }}
+            else sqlApplyFilter();
+        }}
+    }}
+
     function showTab(id, btn) {{
         document.querySelectorAll('.section').forEach(function(s) {{ s.classList.remove('active'); }});
         document.querySelectorAll('.nav-btn').forEach(function(b) {{ b.classList.remove('active'); }});
@@ -3649,6 +5016,8 @@ flowchart TD
             setTimeout(renderDockerDiagram, 50);
         }} else if (id === 'swagger') {{
             setTimeout(renderSwaggerUI, 50);
+        }} else if (id === 'sql') {{
+            setTimeout(function() {{ renderSqlCatalog(false); }}, 10);
         }}
     }}
 
@@ -3659,10 +5028,11 @@ flowchart TD
         var swaggerPanes = document.querySelectorAll('.swagger-view-pane');
         swaggerPanes.forEach(function(p) {{ p.style.display = 'block'; }});
 
-        // Pre-render diagrams and Swagger UI if not initialized yet
+        // Pre-render diagrams, Swagger UI and the full SQL catalog if not initialized yet
         if (typeof renderSysarchDiagram === 'function') renderSysarchDiagram();
         if (typeof renderDockerDiagram === 'function') renderDockerDiagram();
         if (typeof renderSwaggerUI === 'function') renderSwaggerUI();
+        if (typeof renderSqlCatalog === 'function') renderSqlCatalog(true);
 
         setTimeout(function() {{
             window.print();
@@ -3672,7 +5042,7 @@ flowchart TD
             if (activeBtn) {{
                 var onClickAttr = activeBtn.getAttribute('onclick');
                 if (onClickAttr) {{
-                    var match = onClickAttr.match(/showTab\('([^']+)'/);
+                    var match = onClickAttr.match(/showTab\\('([^']+)'/);
                     if (match) showTab(match[1], activeBtn);
                 }}
             }}
@@ -3857,7 +5227,8 @@ if __name__ == '__main__':
             print(f"[arch-wiki] Syncing codebase changes with architecture.json at {json_path}...")
         else:
             print(f"[arch-wiki] Initializing fresh architecture manifest at {json_path}...")
-        data = init_architecture(target_path)
+        data = init_architecture(target_path, placeholder_sql='--placeholder-sql' in sys.argv,
+                                 skip_overrides='--skip-overrides' in sys.argv)
     else:
         data = load_architecture(json_path)
 

@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+.pytest_cache/
+tests/fixtures/*/docs/
+.claude/
