@@ -457,19 +457,59 @@ def _env_links(svc_name, env, all_names):
                 break
     return links
 
+_COMPOSE_NAME_RE = re.compile(r'^(?:docker-)?compose(?:[.\-][\w.\-]+)?\.ya?ml$')
+_COMPOSE_SKIP_DIRS = {'node_modules', 'build', 'target', 'dist', '.git', '.gradle', '.idea', 'docs', 'test', 'tests', 'src'}
+
+def _find_compose_files(root, depth=2):
+    """Compose files at the root or up to `depth` folders down (deployment/, docker/, infra/ …).
+
+    Root files first; then sub-folders in name order. Override files
+    (docker-compose.override.yml, compose.prod.yaml …) come after their base file."""
+    found = []
+    def _visit(d, level):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        base_first = sorted((n for n in names if _COMPOSE_NAME_RE.match(n)),
+                            key=lambda n: (n.count('.') > 1, n))
+        found.extend(os.path.join(d, n) for n in base_first)
+        if level >= depth: return
+        for n in names:
+            if n.startswith('.') or n in _COMPOSE_SKIP_DIRS: continue
+            sub = os.path.join(d, n)
+            if os.path.isdir(sub): _visit(sub, level + 1)
+    _visit(root, 0)
+    return found
+
+def _load_compose(path):
+    svcs = {}
+    if _yaml is not None:
+        try:
+            svcs = _parse_compose_yaml(path)
+        except Exception as ex:
+            print(f"[arch-wiki] WARN: PyYAML could not parse {os.path.basename(path)} ({ex}); using line parser")
+            svcs = {}
+    if not svcs:
+        svcs = _parse_compose_lines(open(path, encoding='utf-8', errors='ignore').read().splitlines())
+    return svcs
+
 def _scan_docker(root):
-    for name in ['docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml']:
-        path = os.path.join(root, name)
-        if not os.path.isfile(path): continue
-        svcs = {}
-        if _yaml is not None:
-            try:
-                svcs = _parse_compose_yaml(path)
-            except Exception as ex:
-                print(f"[arch-wiki] WARN: PyYAML could not parse {name} ({ex}); using line parser")
-                svcs = {}
-        if not svcs:
-            svcs = _parse_compose_lines(open(path, encoding='utf-8', errors='ignore').read().splitlines())
+    files = _find_compose_files(root)
+    if files:
+        # Merge every compose file; the first definition of a service wins, later files only
+        # add services (override files typically tweak ports/env of existing ones).
+        svcs, sources = {}, []
+        for path in files:
+            part = _load_compose(path)
+            if not part: continue
+            rel = os.path.relpath(path, root).replace('\\', '/')
+            sources.append(rel)
+            for sn, sv in part.items():
+                if sn not in svcs:
+                    sv['source'] = rel
+                    svcs[sn] = sv
+        name = ', '.join(sources) if len(sources) > 1 else (sources[0] if sources else files[0])
 
         all_svcs = list(svcs.keys())
         for sn, sv in svcs.items():
@@ -496,6 +536,8 @@ def _scan_docker(root):
             entry = {'id':sn,'name':sn.replace('-',' ').replace('_',' ').title(),'type':t,
                 'image':sv['image'] or f"build:{sv['build']}",
                 'port':port,'description':desc,'features':[]}
+            if len(sources) > 1 and sv.get('source'):
+                entry['source'] = sv['source']
             node = {'id':sn,'label':f"{sn}{':%d'%port if port else ''}",'type':t,'port':port}
             if optional:
                 entry['optional'] = True; entry['profiles'] = list(sv['profiles'])
@@ -749,14 +791,10 @@ def _detect_arch_type(root, fw):
       - 'modular_monolith': Multi-module repo (e.g. Maven pom.xml with <modules> or subfolder services without docker)
       - 'microservice': Multi-service project with docker-compose or microservices architecture
     """
-    # Check docker-compose first
-    for name in ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']:
-        if os.path.isfile(os.path.join(root, name)):
-            try:
-                txt = open(os.path.join(root, name), encoding='utf-8', errors='ignore').read()
-                if 'services:' in txt:
-                    return 'microservice'
-            except: pass
+    # Check docker-compose first (root or deployment/, docker/, infra/ … up to 2 levels deep)
+    for path in _find_compose_files(root):
+        if 'services:' in _read(path):
+            return 'microservice'
 
     # Check Maven pom.xml for <modules>
     pom_path = os.path.join(root, 'pom.xml')
@@ -2396,7 +2434,7 @@ def _scan_prerequisites(root, fw, infrastructure, workspaces, java_info=None):
             })
 
     # 2. Containerization / Infrastructure tools
-    has_compose = os.path.isfile(os.path.join(root, 'docker-compose.yml')) or os.path.isfile(os.path.join(root, 'docker-compose.yaml'))
+    has_compose = bool(_find_compose_files(root))
     if infrastructure or has_compose:
         tools.append({
             "name": "Docker & Docker Compose",

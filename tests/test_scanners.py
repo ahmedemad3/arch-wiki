@@ -640,3 +640,32 @@ def test_sql_tables_chained_ctes_and_join_fetch(build_html):
     assert t("SELECT o FROM Order o JOIN FETCH o.orderItems WHERE o.id = :id", jpql=True) == ['Order']
     assert t("SELECT o FROM Order o LEFT JOIN FETCH o.items oi JOIN FETCH oi.product", jpql=True) == ['Order']
     assert t("SELECT * FROM orders o JOIN fetch_log f ON f.order_id = o.id") == ['orders', 'fetch_log']
+
+
+def test_compose_discovered_in_subfolders_and_merged(build_html, fixture_project, tmp_path):
+    root = fixture_project('spring-kts')
+    # move the root compose under deployment/ and add a second file with an extra service + an override
+    os.makedirs(os.path.join(root, 'deployment'))
+    os.rename(os.path.join(root, 'docker-compose.yml'), os.path.join(root, 'deployment', 'docker-compose.yml'))
+    with open(os.path.join(root, 'deployment', 'docker-compose.override.yml'), 'w') as f:
+        f.write('services:\n  postgres:\n    ports: ["15432:5432"]\n  zipkin:\n    image: openzipkin/zipkin:3\n    ports: ["9411:9411"]\n')
+    with open(os.path.join(root, 'docker-compose.test.yml'), 'w') as f:                      # ignored: 'test' variant still a compose file at root
+        f.write('services:\n  otel-collector:\n    image: otel/opentelemetry-collector:0.1\n')
+    os.makedirs(os.path.join(root, 'node_modules', 'x'))
+    with open(os.path.join(root, 'node_modules', 'x', 'docker-compose.yml'), 'w') as f:
+        f.write('services:\n  junk:\n    image: junk\n')
+
+    files = [os.path.relpath(f, root) for f in build_html._find_compose_files(root)]
+    assert files == ['docker-compose.test.yml', 'deployment/docker-compose.yml', 'deployment/docker-compose.override.yml']
+
+    infra, diagram = build_html._scan_docker(root)
+    ids = [s['id'] for s in infra]
+    assert 'junk' not in ids
+    assert ids[:1] == ['otel-collector']                          # root file first
+    assert set(ids) == {'otel-collector', 'api', 'postgres', 'kafka', 'keycloak', 'mailpit', 'nginx', 'zipkin'}
+    by = {s['id']: s for s in infra}
+    assert by['postgres']['port'] == 5432                         # first definition wins over the override
+    assert by['postgres']['source'] == 'deployment/docker-compose.yml'
+    assert by['zipkin']['type'] == 'monitoring' and by['zipkin']['source'] == 'deployment/docker-compose.override.yml'
+    assert 'deployment/docker-compose.yml' in diagram['description']
+    assert build_html._detect_arch_type(root, 'spring') == 'microservice'
