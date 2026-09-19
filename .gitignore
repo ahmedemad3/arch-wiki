@@ -8,3 +8,7 @@ __pycache__/
 .pytest_cache/
 tests/fixtures/*/docs/
 .claude/
+tests/demo-target/
+tests/*.md
+tests/architecture.*
+tests/test_pr1_review.py

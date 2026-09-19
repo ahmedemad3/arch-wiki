@@ -2,12 +2,13 @@
 
 > **Framework-agnostic architecture documentation skill** — Automatically sync your API modules, endpoints, Docker topology, SQL queries, permissions, and Swagger spec into a beautiful interactive HTML dashboard.
 
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/ahmedemad3/arch-wiki/releases)
 [![Works with Antigravity](https://img.shields.io/badge/Antigravity-✓-blue)](#setup-in-antigravity)
 [![Works with Claude Code](https://img.shields.io/badge/Claude_Code-✓-orange)](#setup-in-claude-code--cursor)
 [![Works with Cursor](https://img.shields.io/badge/Cursor-✓-purple)](#setup-in-claude-code--cursor)
 [![Works with Codex](https://img.shields.io/badge/Codex-✓-green)](#setup-in-openai-codex)
 [![Works with OpenCode](https://img.shields.io/badge/OpenCode-✓-teal)](#setup-in-opencode)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-yellow)](https://python.org)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-yellow)](https://python.org)
 
 ---
 
@@ -29,11 +30,12 @@ The output is a **single self-contained HTML file** with:
 - 🤖 Interactive Senior Developer Analysis Prompts modal for every API endpoint
 - 🏗️ System Architecture diagram with pan/zoom & hand cursor (Mermaid)
 - 🐋 Docker Topology diagram with pan/zoom & hand cursor (Mermaid)
+- 📨 Async Messaging & Event Topology (Kafka, RabbitMQ, JMS, SQS)
 - 📄 One-click PDF Export (exports all 11 sections into a single formatted PDF document)
 - ⚡ Interactive Swagger UI (try-it-out enabled with polished dark mode theme)
-- 🔐 Permissions & RBAC mapping
-- 🗃️ SQL Queries catalog with syntax highlighting
-- 🖥️ Infrastructure services catalog
+- 🔐 Permissions & RBAC mapping (including SpEL object-level security)
+- 🗃️ SQL & JPQL Queries catalog with syntax highlighting
+- 🖥️ Infrastructure services catalog with environment-inferred edges
 - 🛡️ Core Layer & Request Pipeline docs
 
 ---
@@ -372,9 +374,49 @@ The benchmark also exposed an important limitation:
 Therefore, the next step is to measure **accuracy**, not just exploration reduction.
 
 
+---
+
+## 🚀 What's New in v1.1.0
+
+Release **v1.1.0** represents a major architectural hardening release, bringing full enterprise **Spring Boot & Gradle Kotlin DSL (KTS)** support, AST-accurate lexer parsing, and robust real-world codebase discovery:
+
+### ☕ Enterprise Spring Boot & Gradle Kotlin DSL Support
+- **Full Kotlin DSL (`build.gradle.kts`, `settings.gradle.kts`) & Version Catalogs:** Extracts modules, dependencies, and Java toolchain versions from `libs.versions.toml` and Gradle scripts.
+- **Maven Multi-Module & Java 21+:** Deep inspection of root and child `pom.xml` files with compiler release tracking and parent pom inheritance.
+- **Actuator Endpoint Detection:** Auto-discovers enabled Spring Actuator endpoints (`/actuator/health`, `/actuator/info`, `/actuator/prometheus`).
+
+### 🔍 Lexer-Based Annotation & Route Parsing
+- Replaces fragile regular expressions with a state-machine Java lexer.
+- Supports class-level × method-level Cartesian product route expansion (`@RequestMapping`, `@GetMapping`, `@PostMapping`, `@PutMapping`, `@DeleteMapping`).
+- Handles Java comments, raw strings, multiline blocks, and mixed path arrays (`value = {"/api", "/v1"}`).
+
+### 🔗 Cross-File Constant Resolution
+- Automatically indexes repository `public static final String` constants.
+- Resolves constant references across classes and packages for Kafka/messaging topic names and REST route path segments (e.g. `AppConstants.ORDERS_TOPIC` -> `"orders"`).
+
+### 🗃️ Real SQL & JPQL Query Extraction
+- Extracts explicit SQL and JPQL from `@Query` annotations, text blocks, and `JdbcTemplate` calls.
+- **Chained CTE Isolation:** Correctly isolates and excludes chained Common Table Expressions (`WITH a AS (...), b AS (...)`), ensuring CTE aliases never leak into the database table catalog.
+- **JPQL `JOIN FETCH` Protection:** Explicitly filters out `FETCH` keywords from JPQL association joins.
+
+### 🐋 Docker Compose Multi-Folder Discovery & Edge Inference
+- **Subfolder Search:** Automatically discovers `docker-compose*.yml` / `compose*.yml` up to 2 directories deep (`deployment/`, `docker/`, `infra/`, etc.).
+- **Multi-File Merging:** Intelligently merges base compose files with environment overrides.
+- **Runtime Edge Inference:** Infers runtime dependencies between services based on environment variables (`*_HOST`, `*_URL`, `KAFKA_BOOTSTRAP_SERVERS`, etc.).
+
+### 🔐 SpEL Security Normalization & Object-Level RBAC
+- Parses Spring Security `@PreAuthorize` SpEL expressions (`hasRole(...)`, `hasAuthority(...)`, `isAuthenticated()`, `permitAll()`).
+- Identifies object-level security flags (`#id`, `@bean.method()`, `hasPermission(...)`).
+
+### 🛠️ CLI Flags, Extensibility & CI/CD
+- **`--skip-overrides` Flag:** Allows running raw codebase scans without triggering custom `arch_overrides.py` hooks.
+- **`--placeholder-sql` Flag:** Backwards compatibility mode to preserve synthetic placeholder SQL counts for older workflows.
+- **GitHub Actions CI:** Added automated CI test matrix in `.github/workflows/test.yml` running across Python 3.9 and Python 3.12.
+
+
 ## Requirements
 
-- **Python 3.8+** (only standard library — `json`, `re`, `os`, `sys`, `datetime` — no `pip install` needed)
+- **Python 3.9+** (standard library — `json`, `re`, `os`, `sys`, `datetime` — no mandatory external dependencies; optional `pyyaml` for advanced Docker compose parsing)
 - **Any AI assistant** that can read/write files and run shell commands
 - **Docker is optional** — if `dockerDiagram.nodes` is empty, the Docker tab shows a friendly placeholder
 

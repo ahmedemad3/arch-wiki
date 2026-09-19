@@ -1,6 +1,6 @@
 {
   "name": "arch-wiki",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Framework-agnostic architecture map & documentation generator skill for AI coding assistants.",
   "main": "bin/install.js",
   "bin": {
