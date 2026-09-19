@@ -620,3 +620,23 @@ def test_system_endpoints_follow_actuator(build_html, fixture_project):
         {'method': 'GET', 'path': '/health', 'auth': False, 'description': 'Health check endpoint'}]
     assert [e['path'] for e in build_html._system_endpoints('spring', {'actuator': True, 'contextPath': '/api'})] == [
         '/api/actuator/health', '/api/actuator/info']
+
+
+# ---------------------------------------------------------------- reviewer findings, round 2
+
+def test_sql_tables_chained_ctes_and_join_fetch(build_html):
+    t = build_html._sql_tables
+    assert t("WITH eligible AS (SELECT id FROM users WHERE active = true), "
+             "priced AS (SELECT e.id, p.amount FROM eligible e JOIN prices p ON p.user_id = e.id) "
+             "SELECT * FROM priced WHERE amount > 10") == ['users', 'prices']
+    assert t("""WITH a AS (
+                    SELECT 1 FROM t1
+                ),
+                b (x) AS (
+                    SELECT x FROM a
+                ),
+                c AS (SELECT * FROM b JOIN t2 ON 1=1)
+                INSERT INTO t3 SELECT * FROM c""") == ['t1', 't2', 't3']
+    assert t("SELECT o FROM Order o JOIN FETCH o.orderItems WHERE o.id = :id", jpql=True) == ['Order']
+    assert t("SELECT o FROM Order o LEFT JOIN FETCH o.items oi JOIN FETCH oi.product", jpql=True) == ['Order']
+    assert t("SELECT * FROM orders o JOIN fetch_log f ON f.order_id = o.id") == ['orders', 'fetch_log']

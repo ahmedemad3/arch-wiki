@@ -1336,10 +1336,11 @@ def _sql_tables(sql, jpql=False):
                ' ', s, flags=re.IGNORECASE)                                     # row-lock clause is not a table
     # CTE names (WITH a AS (...), b AS (...)) are not tables either
     ctes = set()
-    for wm in re.finditer(r'\b(?:WITH(?:\s+RECURSIVE)?|,)\s*([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s+AS\s*\(', s, re.IGNORECASE):
+    # `\bWITH name AS (` opens the chain; `, name AS (` continues it (no \b: the comma follows a ')')
+    for wm in re.finditer(r'(?:\bWITH(?:\s+RECURSIVE)?|,)\s*([A-Za-z_]\w*)\s*(?:\([^)]*\))?\s+AS\s*\(', s, re.IGNORECASE):
         ctes.add(wm.group(1).lower())
     tables = []
-    pat = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+(?:ONLY\s+|LATERAL\s+)?(?!SELECT\b|\(|VALUES\b)'
+    pat = re.compile(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+(?:ONLY\s+|LATERAL\s+|FETCH\s+)?(?!SELECT\b|\(|VALUES\b|FETCH\b)'
                      r'([`"\[]?[A-Za-z_][\w$]*[`"\]]?(?:\.[`"\[]?[A-Za-z_][\w$]*[`"\]]?)*)', re.IGNORECASE)
     for m in pat.finditer(s):
         t = re.sub(r'[`"\[\]]', '', m.group(1))
