@@ -1007,6 +1007,22 @@ def _anno_literal(anno, key, spans):
     parts = [v for s, e, v in spans if a <= s and e <= b]
     return ''.join(parts) if parts else None
 
+def _split_plus_chain(expr):
+    """Split `a + "b" + C.D` on the `+` operators that sit outside string literals."""
+    terms, cur, in_str, esc = [], [], False, False
+    for ch in expr:
+        if in_str:
+            cur.append(ch)
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == '"': in_str = False
+            continue
+        if ch == '"': in_str = True; cur.append(ch)
+        elif ch == '+': terms.append(''.join(cur)); cur = []
+        else: cur.append(ch)
+    terms.append(''.join(cur))
+    return [t for t in terms if t.strip()]
+
 def _string_values(expr, consts=None):
     """String literals inside an annotation attribute value.
 
@@ -1017,20 +1033,70 @@ def _string_values(expr, consts=None):
     expr = expr.strip()
     if expr.startswith('{') and expr.endswith('}'):
         return [v for part in _split_top_level(expr[1:-1]) for v in _string_values(part, consts)]
+    # evaluate a `+` chain term by term: every term must be a literal or a known constant
+    terms = _split_plus_chain(expr)
+    out, unresolved = [], False
+    for term in terms:
+        term = term.strip()
+        lit = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', term)
+        if lit:
+            out.append(_java_unescape(lit.group(1))); continue
+        key = term.replace(' ', '')
+        if consts and key in consts:
+            out.append(consts[key]); continue
+        if consts and key.split('.')[-1] in consts and re.fullmatch(r'[\w.]+', key):
+            out.append(consts[key.split('.')[-1]]); continue
+        unresolved = True
+    if out and not unresolved:
+        return [''.join(out)]
     lits = re.findall(r'"((?:[^"\\]|\\.)*)"', expr)
-    if lits:
-        return [_java_unescape(''.join(lits))]
-    if consts:
-        key = expr.replace(' ', '')
-        if key in consts: return [consts[key]]
-        if key.split('.')[-1] in consts: return [consts[key.split('.')[-1]]]
-    return []
+    return [_java_unescape(''.join(lits))] if lits else []
 
 def _java_string_consts(code):
     """NAME → value for `static final String NAME = "…"` fields (and "a" + "b" chains)."""
     consts = {}
     for m in re.finditer(r'\bString\s+([A-Z_][A-Z0-9_]*)\s*=\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+);', code):
         consts[m.group(1)] = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)))
+    return consts
+
+_PROJECT_CONSTS_CACHE = {}
+
+def _java_project_consts(root):
+    """`Class.NAME` → value for every `static final String` constant in the tree, plus bare `NAME`
+    when it is unambiguous across classes. Built once per root; used to resolve cross-file
+    references such as AppConstants.ORDERS_TOPIC in mappings, @KafkaListener topics and sends."""
+    cached = _PROJECT_CONSTS_CACHE.get(root)
+    if cached is not None:
+        return cached
+    by_class, bare = {}, {}
+    for r, dirs, fls in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ('build', 'target', 'node_modules', '.git', '.gradle', '.idea', 'test')]
+        for f in fls:
+            if not f.endswith('.java'): continue
+            txt = _read(os.path.join(r, f))
+            if 'static final String' not in txt and 'final static String' not in txt: continue
+            code, _ = _java_lex(txt)
+            for k, v in _java_string_consts(code).items():
+                by_class[f"{f[:-5]}.{k}"] = v
+                bare.setdefault(k, set()).add(v)
+    for k, vals in bare.items():
+        if len(vals) == 1:
+            by_class.setdefault(k, next(iter(vals)))
+    _PROJECT_CONSTS_CACHE[root] = by_class
+    return by_class
+
+def _java_file_consts(code, root):
+    """Constants visible in one file: its own fields, `Class.NAME` project-wide, and names pulled
+    in with `import static …Class.NAME;` / `import static …Class.*;`."""
+    consts = dict(_java_project_consts(root))
+    for m in re.finditer(r'^\s*import\s+static\s+[\w.]*?\.(\w+)\.(\w+|\*)\s*;', code, re.MULTILINE):
+        cls, name = m.group(1), m.group(2)
+        if name == '*':
+            for k, v in _java_project_consts(root).items():
+                if k.startswith(cls + '.'): consts[k.split('.', 1)[1]] = v
+        elif f"{cls}.{name}" in consts:
+            consts[name] = consts[f"{cls}.{name}"]
+    consts.update(_java_string_consts(code))            # same-file definitions win
     return consts
 
 _JAVA_METHOD_RE = re.compile(
@@ -1172,8 +1238,6 @@ def _scan_java_spring(root, arch_type=None):
         for f in fls:
             if f.endswith('.java'):
                 files.append(os.path.join(r, f))
-    by_class = {os.path.basename(f)[:-5]: f for f in files}
-
     mod_map = {}
     for rf in sorted(files):
         txt = open(rf, encoding='utf-8', errors='ignore').read()
@@ -1199,14 +1263,8 @@ def _scan_java_spring(root, arch_type=None):
             svc_title = mid.replace('-service', '').replace('_service', '').replace('-', ' ').title()
         name = svc_title
 
-        # Constants usable in mapping paths: this file plus any `Other.CONST` references
-        consts = _java_string_consts(code)
-        for ref in set(re.findall(r'\b([A-Z][A-Za-z0-9_]*)\.([A-Z_][A-Z0-9_]*)\b', code)):
-            other = by_class.get(ref[0])
-            if other and other != rf:
-                oc, _ = _java_lex(open(other, encoding='utf-8', errors='ignore').read())
-                for k, v in _java_string_consts(oc).items():
-                    consts.setdefault(f"{ref[0]}.{k}", v)
+        # Constants usable in mapping paths: this file, `Other.CONST` anywhere in the tree, static imports
+        consts = _java_file_consts(code, root)
 
         class_name, class_pos = _java_type_name(code, spans)
         class_annos = [a for a in annos if a['start'] < class_pos]
@@ -1539,7 +1597,7 @@ def _scan_messaging_java(root):
                 continue
             rel = os.path.relpath(rf, root).replace('\\', '/')
             code, spans = _java_lex(txt)
-            consts = _java_string_consts(code)
+            consts = _java_file_consts(code, root)
             class_name, _ = _java_type_name(code, spans)
             class_name = class_name or f[:-5]
             methods = _java_methods(code, spans)
@@ -2173,6 +2231,7 @@ def init_architecture(target_root=None, placeholder_sql=False):
         if java_info.get('springBootVersion'):
             fw_info = dict(fw_info, framework=f"Spring Boot {java_info['springBootVersion']}")
 
+    _PROJECT_CONSTS_CACHE.pop(root, None)
     print(f"[arch-wiki] Root: {root} | Framework: {fw}")
 
     # 3. Scan docker-compose

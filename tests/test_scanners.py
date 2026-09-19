@@ -669,3 +669,42 @@ def test_compose_discovered_in_subfolders_and_merged(build_html, fixture_project
     assert by['zipkin']['type'] == 'monitoring' and by['zipkin']['source'] == 'deployment/docker-compose.override.yml'
     assert 'deployment/docker-compose.yml' in diagram['description']
     assert build_html._detect_arch_type(root, 'spring') == 'microservice'
+
+
+def test_messaging_resolves_cross_file_constants(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java' / 'com' / 'acme'
+    (src / 'common').mkdir(parents=True); (src / 'inventory').mkdir()
+    (src / 'common' / 'AppConstants.java').write_text('''
+        package com.acme.common;
+        public final class AppConstants {
+            public static final String ORDERS_TOPIC = "orders";
+            public static final String PRODUCT_TOPIC = "products";
+            public static final String API = "/api";
+        }''')
+    (src / 'inventory' / 'KafkaListenerConfig.java').write_text('''
+        package com.acme.inventory;
+        import com.acme.common.AppConstants;
+        import static com.acme.common.AppConstants.PRODUCT_TOPIC;
+        @Component public class KafkaListenerConfig {
+            @KafkaListener(topics = AppConstants.ORDERS_TOPIC, groupId = "inventory") public void onEvent(String e) {}
+            @KafkaListener(topics = PRODUCT_TOPIC) public void onProduct(String e) {}
+        }''')
+    (src / 'inventory' / 'InventoryOrderManageService.java').write_text('''
+        package com.acme.inventory;
+        import com.acme.common.AppConstants;
+        @Service public class InventoryOrderManageService {
+            private final KafkaTemplate<String, Object> kafkaTemplate;
+            public void reserve(Object o) { kafkaTemplate.send(AppConstants.ORDERS_TOPIC, o); }
+        }''')
+    (src / 'inventory' / 'InventoryController.java').write_text('''
+        package com.acme.inventory;
+        import static com.acme.common.AppConstants.*;
+        @RestController @RequestMapping(API + "/inventory")
+        public class InventoryController { @GetMapping("/{id}") public Object one(@PathVariable Long id) { return null; } }''')
+    msg = build_html._scan_messaging_java(str(tmp_path))
+    assert [l['topics'] for l in msg['listeners']] == [['orders'], ['products']]
+    assert msg['producers'] == [{'broker': 'kafka', 'topic': 'orders', 'handler': 'InventoryOrderManageService.reserve()',
+                                 'file': 'src/main/java/com/acme/inventory/InventoryOrderManageService.java'}]
+    mods = build_html._scan_java_spring(str(tmp_path), arch_type='monolith')
+    ctrl = next(m for m in mods if m['id'] == 'inventory')
+    assert ctrl['basePath'] == '/api/inventory' and ctrl['endpoints'][0]['path'] == '/{id}'
