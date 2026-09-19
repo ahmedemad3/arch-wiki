@@ -7,6 +7,8 @@ import json
 import os
 from html import unescape as html_unescape
 
+import pytest
+
 from conftest import endpoint_index, endpoints
 
 
@@ -65,8 +67,7 @@ def test_generate_html_writes_page(build_html, fixture_project, tmp_path):
     build_html.generate_html(data, out_dir)
     html = open(os.path.join(out_dir, 'architecture.html'), encoding='utf-8').read()
     assert '<title>' in html and 'Acme Express Api' in html
-    json.loads(html.split('id="swaggerOpenApiJsonSrc">', 1)[1].split('</code>', 1)[0]
-               .replace('&quot;', '"').replace('&#x27;', "'").replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&'))
+    json.loads(html_unescape(html.split('id="swaggerOpenApiJsonSrc">', 1)[1].split('</code>', 1)[0]))
 
 
 # ---------------------------------------------------------------- Spring / Gradle KTS
@@ -271,6 +272,7 @@ EXPECTED_SPRING_SERVICES = [
 
 
 def test_docker_yaml_ports_profiles_depends_and_env_edges(build_html, fixture_project):
+    pytest.importorskip('yaml')   # env-derived edges / port lists need the YAML parser
     root = fixture_project('spring-kts')
     infra, diagram = build_html._scan_docker(root)
     assert [(s['id'], s['type'], s['port']) for s in infra] == EXPECTED_SPRING_SERVICES
@@ -333,6 +335,7 @@ def test_infer_service_type_from_image(build_html):
 
 
 def test_docker_diagram_html_has_styles_for_new_types(build_html, fixture_project):
+    pytest.importorskip('yaml')   # env-derived edges / port lists need the YAML parser
     root = fixture_project('spring-kts')
     data = build_html.init_architecture(root)
     out_dir = os.path.join(root, 'docs', 'architecture')
@@ -715,3 +718,36 @@ def test_messaging_resolves_cross_file_constants(build_html, tmp_path):
     mods = build_html._scan_java_spring(str(tmp_path), arch_type='monolith')
     ctrl = next(m for m in mods if m['id'] == 'inventory')
     assert ctrl['basePath'] == '/api/inventory' and ctrl['endpoints'][0]['path'] == '/{id}'
+
+
+def test_skip_overrides_flag(build_html, fixture_project):
+    root = fixture_project('express')
+    arch_dir = os.path.join(root, 'docs', 'architecture')
+    os.makedirs(arch_dir, exist_ok=True)
+    with open(os.path.join(arch_dir, 'arch_overrides.py'), 'w') as f:
+        f.write('def apply(data, root):\n    raise RuntimeError("hook under development")\n')
+    data = build_html.init_architecture(root, skip_overrides=True)
+    assert data['meta']['displayName'] == 'Acme Express Api'
+
+
+def test_no_double_slash_paths_when_base_is_root(build_html, tmp_path):
+    src = tmp_path / 'src' / 'main' / 'java'; src.mkdir(parents=True)
+    (src / 'FallbackController.java').write_text("""
+        @RestController public class FallbackController {
+            @GetMapping("/fallback/api/inventory/{id}") public String inv(@PathVariable String id) { return "x"; }
+        }""")
+    (src / 'HomeController.java').write_text("""
+        @Controller @RequestMapping("/") public class HomeController {
+            @GetMapping({"", "/"}) public String home() { return "index"; }
+            @GetMapping("//login") public String login() { return "login"; }
+            @RequestMapping(value = "/api/cart/", method = RequestMethod.GET) public String cart() { return "c"; }
+        }""")
+    data = build_html.init_architecture(str(tmp_path))
+    paths = [p for _, p in endpoints(data)] + [e['path'] for d in data['permissions']['details'] for e in d['endpoints']]
+    assert paths and not any('//' in p for p in paths)
+    assert sorted(endpoints(data)) == [('GET', '/'), ('GET', '/api/cart'), ('GET', '/fallback/api/inventory/{id}'), ('GET', '/login')]
+    out_dir = os.path.join(str(tmp_path), 'docs', 'architecture')
+    build_html.generate_html(data, out_dir)
+    page = open(os.path.join(out_dir, 'architecture.html'), encoding='utf-8').read()
+    import re
+    assert not re.search(r'[">]//[a-z{]', page)

@@ -114,6 +114,7 @@ def apply(data: dict, root: str) -> dict | None
   the hook changes endpoint permissions it should rebuild the catalog with
   `import build_html; data["permissions"] = build_html.build_permissions(data["modules"])`.
 - Exceptions abort the run (the traceback names the hook file), so a stale catalog fails loudly.
+  Pass `--skip-overrides` to run the raw scanners without the hook (handy while writing it).
 - Start from `templates/arch_overrides.example.py` in the skill directory — it shows merging a
   `permissions.json` catalog, attributing endpoints to frontend pages, and correcting service
   descriptions. Copy it to `docs/architecture/arch_overrides.py` and edit.
@@ -160,8 +161,11 @@ Add a new entry for each Docker container/service:
   "features": ["feature 1", "feature 2"]
 }
 ```
-`ports` / `optional` / `profiles` are only present when relevant. The scanner uses **PyYAML when
-installed** (`pip install pyyaml`) and understands every `ports:` form (`"5432:5432"`, flow lists,
+`ports` / `optional` / `profiles` are only present when relevant. Compose files are found at the
+project root **or up to two folders down** (`deployment/`, `docker/`, `infra/` …); several files
+are merged (first definition of a service wins, override files after their base) and each service
+then records its `source` file. The scanner uses **PyYAML when installed** (`pip install pyyaml`,
+also listed in `tests/requirements.txt`) and understands every `ports:` form (`"5432:5432"`, flow lists,
 `"127.0.0.1:8080:8080"`, ranges, `/udp`, long `target/published` syntax), `profiles:` (→ `optional`),
 `depends_on` in list and map form, and YAML anchors. Without PyYAML a simpler line parser handles
 2-space-indented block-style files. Types are inferred from the image name (`keycloak` → auth,

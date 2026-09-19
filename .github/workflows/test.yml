@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+        pyyaml: ["with-pyyaml", "without-pyyaml"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          if [ "${{ matrix.pyyaml }}" = "with-pyyaml" ]; then python -m pip install pyyaml; fi
+      - name: Run scanner tests
+        run: python -m pytest tests/ -q
+      - name: Smoke-run the generator on the Spring fixture
+        run: |
+          cp -r tests/fixtures/spring-kts /tmp/spring-kts
+          python -W error::SyntaxWarning templates/build_html.py /tmp/spring-kts --init
+          test -s /tmp/spring-kts/docs/architecture/architecture.html

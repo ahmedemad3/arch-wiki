@@ -46,6 +46,11 @@ def _frontend_api_usage(root):
 
     Looks for calls like `api.get('/api/v1/invoices')` / `http.post(\"/api/…\")`
     under frontend/src and attributes them to the page folder they live in.
+
+    It reads every source file under frontend/src on each run. For a large
+    frontend narrow the walk to the API-client folder (e.g. frontend/src/api)
+    or cache the result keyed on the newest mtime — the hook runs on every
+    --init / --sync.
     """
     usage = {}
     fe = os.path.join(root, 'frontend', 'src')

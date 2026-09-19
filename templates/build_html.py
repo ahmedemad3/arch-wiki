@@ -860,6 +860,11 @@ def _java_lex(txt):
 
     string_spans is a list of (start, end, value) for every "…" literal and
     \"\"\"…\"\"\" text block, with value already unescaped / de-indented.
+
+    Limitation: Java translates \\uXXXX escapes *before* tokenising, so a
+    \\u0022 (") outside a literal would open a string for javac but not here.
+    Real code essentially never does this; the escapes inside literals are
+    kept verbatim, which is what the catalog wants to show anyway.
     """
     n = len(txt)
     out = list(txt)
@@ -2191,11 +2196,13 @@ def _system_endpoints(fw, java_info=None):
     return [{"method": "GET", "path": "/health", "auth": False, "description": "Health check endpoint"}]
 
 
-def init_architecture(target_root=None, placeholder_sql=False):
+def init_architecture(target_root=None, placeholder_sql=False, skip_overrides=False):
     """Scan the codebase and generate architecture.json automatically.
 
     placeholder_sql=True restores the legacy per-endpoint SQL placeholders for
     Java projects instead of extracting real @Query / SQL literals.
+    skip_overrides=True ignores docs/architecture/arch_overrides.py (useful while
+    developing the hook or to compare raw scanner output).
     """
     if not target_root:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2344,7 +2351,11 @@ def init_architecture(target_root=None, placeholder_sql=False):
         "messaging": messaging
     }
 
-    scaffold = _apply_overrides(scaffold, root, arch_dir)
+    if skip_overrides:
+        if os.path.isfile(os.path.join(arch_dir, OVERRIDES_FILE)):
+            print(f"[arch-wiki] Skipping {OVERRIDES_FILE} (--skip-overrides)")
+    else:
+        scaffold = _apply_overrides(scaffold, root, arch_dir)
 
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(scaffold, f, indent=2)
@@ -5216,7 +5227,8 @@ if __name__ == '__main__':
             print(f"[arch-wiki] Syncing codebase changes with architecture.json at {json_path}...")
         else:
             print(f"[arch-wiki] Initializing fresh architecture manifest at {json_path}...")
-        data = init_architecture(target_path, placeholder_sql='--placeholder-sql' in sys.argv)
+        data = init_architecture(target_path, placeholder_sql='--placeholder-sql' in sys.argv,
+                                 skip_overrides='--skip-overrides' in sys.argv)
     else:
         data = load_architecture(json_path)
 
